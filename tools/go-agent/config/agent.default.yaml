@@ -48,6 +48,11 @@ reporter:
   grpc:
     # The gRPC server address of the backend service.
     backend_service: ${SW_AGENT_REPORTER_GRPC_BACKEND_SERVICE:127.0.0.1:11800}
+    # If true, the agent will periodically resolve the backend service DNS and update gRPC receiver addresses.
+    resolve_dns_periodically: ${SW_AGENT_REPORTER_GRPC_RESOLVE_DNS_PERIODICALLY:false}
+    # Period in seconds for periodic DNS resolve. 0 means use reporter.check_interval.
+    # Negative values are rejected.
+    resolve_dns_period: ${SW_AGENT_REPORTER_GRPC_RESOLVE_DNS_PERIOD:0}
     # The maximum count of segment for reporting tracing data.
     max_send_queue: ${SW_AGENT_REPORTER_GRPC_MAX_SEND_QUEUE:5000}
     # The authentication string for communicate with backend.

@@ -31,6 +31,14 @@ type ProfileTaskManager interface {
 	RemoveProfileTask()
 }
 
+// ProfileTaskManagerCloser is implemented by managers that own producer
+// lifecycle (e.g. ProfileManager). Optional so external ProfileTaskManager
+// implementations remain source-compatible without a Close method.
+type ProfileTaskManagerCloser interface {
+	// Close stops producing profile results so the reporter can drain and exit.
+	Close()
+}
+
 type TraceProfileTask struct {
 	SerialNumber         string // uuid
 	TaskID               string

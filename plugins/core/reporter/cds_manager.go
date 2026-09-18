@@ -73,9 +73,11 @@ func (r *CDSManager) InitCDS(entity *Entity, cdsWatchers []AgentConfigChangeWatc
 		for {
 			switch r.connManager.GetConnectionStatus(r.serverAddr) {
 			case ConnectionStatusShutdown:
-				break
+				return
 			case ConnectionStatusDisconnect:
-				time.Sleep(r.cdsInterval)
+				if !r.connManager.Wait(r.cdsInterval) {
+					return
+				}
 				continue
 			}
 
@@ -86,7 +88,9 @@ func (r *CDSManager) InitCDS(entity *Entity, cdsWatchers []AgentConfigChangeWatc
 
 			if err != nil {
 				r.logger.Errorf("fetch dynamic configuration error %v", err)
-				time.Sleep(r.cdsInterval)
+				if !r.connManager.Wait(r.cdsInterval) {
+					return
+				}
 				continue
 			}
 
@@ -95,7 +99,9 @@ func (r *CDSManager) InitCDS(entity *Entity, cdsWatchers []AgentConfigChangeWatc
 				r.cdsService.HandleCommand(command)
 			}
 
-			time.Sleep(r.cdsInterval)
+			if !r.connManager.Wait(r.cdsInterval) {
+				return
+			}
 		}
 	}()
 }

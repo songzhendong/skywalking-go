@@ -47,6 +47,8 @@ jobs:
         case:
           - name: gRPC
             path: test/e2e/case/grpc/e2e.yaml
+          - name: gRPC periodic DNS
+            path: test/e2e/case/grpc-periodic-dns/e2e.yaml
           - name: Kafka
             path: test/e2e/case/kafka/e2e.yaml
     steps:
