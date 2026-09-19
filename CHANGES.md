@@ -12,6 +12,9 @@ Release Notes.
 
 #### Bug Fixes
 
+* Fix panic when converting NoInit histograms during meter collect.
+* Fix concurrent map access in RuntimeContext Get/Set/clone.
+
 #### Issues and PR
 - All issues are [here](https://github.com/apache/skywalking/milestone/262?closed=1)
 - All and pull requests are [here](https://github.com/apache/skywalking-go/milestone/9?closed=1)
