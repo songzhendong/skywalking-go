@@ -76,6 +76,11 @@ func (t *TracingContext) RuntimeContext() *RuntimeContext {
 }
 
 type RuntimeContext struct {
+	// mu protects data against concurrent Get/Set/clone on one RuntimeContext.
+	// Production GLS is per-g and TakeSnapShot/ContinueContext already clone, so
+	// sharing is uncommon; the lock is defensive for residual share paths and
+	// matches CorrelationContext (bare-map concurrent access is a fatal error).
+	mu   sync.RWMutex
 	data map[string]interface{}
 }
 
@@ -89,6 +94,11 @@ func NewTracingContext() *TracingContext {
 }
 
 func (r *RuntimeContext) clone() *RuntimeContext {
+	if r == nil {
+		return &RuntimeContext{}
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	if len(r.data) == 0 {
 		// clone runs on every context capture AND continue; skipping the empty
 		// map allocation matters because most requests never set runtime values
@@ -104,10 +114,20 @@ func (r *RuntimeContext) clone() *RuntimeContext {
 }
 
 func (r *RuntimeContext) Get(key string) interface{} {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	return r.data[key]
 }
 
 func (r *RuntimeContext) Set(key string, value interface{}) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if value == nil {
 		delete(r.data, key) // no-op on a nil map
 		return

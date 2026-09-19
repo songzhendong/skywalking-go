@@ -322,7 +322,7 @@ func newHistogramFromExistingBuckets(name string, labels map[string]string, buck
 		labels: labels,
 	}
 
-	result.buckets = make([]*histogramBucket, 0, len(buckets))
+	result.buckets = make([]*histogramBucket, len(buckets))
 	for i, b := range buckets {
 		bucket := b.(NoInitHistogramBucket)
 		result.buckets[i] = &histogramBucket{
