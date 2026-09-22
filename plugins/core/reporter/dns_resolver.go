@@ -150,6 +150,9 @@ type periodicDNSResolver struct {
 	lastGoodAddrs     []resolver.Address
 	lastReported      []resolver.Address
 	updateFailBackoff time.Duration
+	// updateWG tracks UpdateState calls so Close can wait without holding
+	// resolveMu across ClientConn.UpdateState (avoids deadlock with Conn.Close).
+	updateWG sync.WaitGroup
 
 	// DNS health logging: emit on first failure / error-type change / recovery only.
 	lookupUnhealthy       bool
@@ -175,22 +178,13 @@ func (r *periodicDNSResolver) Close() {
 			r.cancel()
 		}
 		close(r.done)
-		// Wait for any UpdateState critical section so Close returns only after
-		// the last possible UpdateState has finished.
-		r.waitResolveIdle()
-		// Join watch so Close does not return while the watch goroutine still runs.
+		// Join watch before waiting UpdateState: watch is the only publisher,
+		// and UpdateState runs outside resolveMu so Conn.Close cannot deadlock.
 		if r.watchDone != nil {
 			<-r.watchDone
 		}
+		r.updateWG.Wait()
 	})
-}
-
-func (r *periodicDNSResolver) waitResolveIdle() {
-	// Empty-looking critical section on purpose: serialize Close with any
-	// in-flight UpdateState that holds resolveMu.
-	r.resolveMu.Lock()
-	_ = r.lastReported
-	r.resolveMu.Unlock()
 }
 
 func (r *periodicDNSResolver) watch() {
@@ -272,10 +266,9 @@ func (r *periodicDNSResolver) resolveAndUpdate() time.Duration {
 	host, port, ips, lookupErr := r.lookupBackendServiceIPs()
 
 	r.resolveMu.Lock()
-	defer r.resolveMu.Unlock()
-
 	select {
 	case <-r.done:
+		r.resolveMu.Unlock()
 		return 0
 	default:
 	}
@@ -286,32 +279,50 @@ func (r *periodicDNSResolver) resolveAndUpdate() time.Duration {
 
 	addresses := r.addressesFromLookupLocked(host, port, ips, lookupErr)
 	r.noteDNSLookupOutcomeLocked(host, canceled, dnsHealthy, lookupErr)
-	return r.publishAddressesLocked(addresses)
-}
-
-func (r *periodicDNSResolver) publishAddressesLocked(addresses []resolver.Address) time.Duration {
 	if sameResolverAddresses(addresses, r.lastReported) {
 		r.updateFailBackoff = 0
+		r.resolveMu.Unlock()
 		return 0
 	}
-	if err := r.cc.UpdateState(resolver.State{Addresses: addresses}); err != nil {
-		if r.logger != nil && r.lastLoggedUpdateState != updateStateErrKey {
-			r.lastLoggedUpdateState = updateStateErrKey
-			r.logger.Errorf("update periodic DNS resolver state error: %v, will retry with backoff", err)
+	toPublish := cloneResolverAddresses(addresses)
+	r.updateWG.Add(1)
+	r.resolveMu.Unlock()
+
+	// UpdateState must not run under resolveMu: ClientConn.Close may call
+	// resolver.Close which needs to join watch without waiting on this lock.
+	var backoff time.Duration
+	func() {
+		defer r.updateWG.Done()
+		err := r.cc.UpdateState(resolver.State{Addresses: toPublish})
+
+		r.resolveMu.Lock()
+		defer r.resolveMu.Unlock()
+		select {
+		case <-r.done:
+			return
+		default:
 		}
-		// Do not ReportError: retry with local backoff (and gRPC may also ResolveNow).
-		r.updateFailBackoff = nextUpdateStateBackoff(r.updateFailBackoff, r.interval)
-		return r.updateFailBackoff
-	}
-	r.lastLoggedUpdateState = ""
-	if r.logger != nil {
-		added, removed := addressSetDelta(r.lastReported, addresses)
-		r.logger.Infof("periodic DNS resolver updated backend address set: count=%d added=%d removed=%d",
-			len(addresses), added, removed)
-	}
-	r.lastReported = cloneResolverAddresses(addresses)
-	r.updateFailBackoff = 0
-	return 0
+		if err != nil {
+			if r.logger != nil && r.lastLoggedUpdateState != updateStateErrKey {
+				r.lastLoggedUpdateState = updateStateErrKey
+				r.logger.Errorf("update periodic DNS resolver state error: %v, will retry with backoff", err)
+			}
+			// Do not ReportError: retry with local backoff (and gRPC may also ResolveNow).
+			r.updateFailBackoff = nextUpdateStateBackoff(r.updateFailBackoff, r.interval)
+			backoff = r.updateFailBackoff
+			return
+		}
+		r.lastLoggedUpdateState = ""
+		if r.logger != nil {
+			added, removed := addressSetDelta(r.lastReported, toPublish)
+			r.logger.Infof("periodic DNS resolver updated backend address set: count=%d added=%d removed=%d",
+				len(toPublish), added, removed)
+		}
+		r.lastReported = toPublish
+		r.updateFailBackoff = 0
+		backoff = 0
+	}()
+	return backoff
 }
 
 func (r *periodicDNSResolver) noteDNSLookupOutcomeLocked(host string, canceled, dnsHealthy bool, lookupErr error) {

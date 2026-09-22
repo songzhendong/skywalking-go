@@ -48,6 +48,8 @@ const (
 	// maxOverflowResults bounds results buffered outside FinalReportResults
 	// before enqueueProfileResult switches to backpressure.
 	maxOverflowResults = 1024
+	// Bound Close-path drains so a stuck reporter consumer cannot hang forever.
+	profileCloseFlushTimeout = 5 * time.Second
 )
 
 type currentTask struct {
@@ -208,9 +210,9 @@ func (m *ProfileManager) drainOverflowLocked() {
 }
 
 // flushOverflowBlocking delivers any overflow before the results channel is closed.
-// Blocks until the shutdown consumer drains FinalReportResults (SignalShutdown
-// starts flushProfileResultsBestEffort before ProfileManager.Close returns).
+// Each send is bounded so a stuck reporter consumer cannot hang ProfileManager.Close.
 func (m *ProfileManager) flushOverflowBlocking() {
+	deadline := time.Now().Add(profileCloseFlushTimeout)
 	for {
 		m.sendMu.Lock()
 		if m.resultsClosed || m.FinalReportResults == nil || len(m.overflow) == 0 {
@@ -220,8 +222,36 @@ func (m *ProfileManager) flushOverflowBlocking() {
 		next := m.overflow[0]
 		m.overflow = m.overflow[1:]
 		ch := m.FinalReportResults
+		leftAfter := len(m.overflow)
 		m.sendMu.Unlock()
-		ch <- next
+
+		remain := time.Until(deadline)
+		if remain <= 0 {
+			m.logCloseFlushTimeout("overflow", leftAfter+1)
+			m.sendMu.Lock()
+			m.overflow = append([]reporter.ProfileResult{next}, m.overflow...)
+			m.sendMu.Unlock()
+			return
+		}
+		timer := time.NewTimer(remain)
+		select {
+		case ch <- next:
+			timer.Stop()
+		case <-timer.C:
+			m.sendMu.Lock()
+			m.overflow = append([]reporter.ProfileResult{next}, m.overflow...)
+			left := len(m.overflow)
+			m.sendMu.Unlock()
+			m.logCloseFlushTimeout("overflow", left)
+			return
+		}
+	}
+}
+
+func (m *ProfileManager) logCloseFlushTimeout(what string, remaining int) {
+	if m.Log != nil {
+		m.Log.Errorf("ProfileManager Close: timed out flushing %s after %s, dropping %d remaining",
+			what, profileCloseFlushTimeout, remaining)
 	}
 }
 

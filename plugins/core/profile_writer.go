@@ -19,6 +19,7 @@ package core
 
 import (
 	"sync"
+	"time"
 )
 
 type ProfilingWriter struct {
@@ -97,7 +98,9 @@ func (w *ProfilingWriter) Flush() {
 // DrainPendingBlocking delivers every pending chunk into reportCh.
 // Must run while the rawCh consumer is alive and before reportCh is closed.
 // Does not hold mu across the channel send so the consumer can progress.
+// Bounded so Close cannot hang if the consumer is stuck.
 func (w *ProfilingWriter) DrainPendingBlocking() {
+	deadline := time.Now().Add(profileCloseFlushTimeout)
 	for {
 		w.mu.Lock()
 		if w.reportCh == nil || len(w.pending) == 0 {
@@ -108,7 +111,24 @@ func (w *ProfilingWriter) DrainPendingBlocking() {
 		w.pending = w.pending[1:]
 		ch := w.reportCh
 		w.mu.Unlock()
-		ch <- d
+
+		remain := time.Until(deadline)
+		if remain <= 0 {
+			w.mu.Lock()
+			w.pending = append([]profileRawData{d}, w.pending...)
+			w.mu.Unlock()
+			return
+		}
+		timer := time.NewTimer(remain)
+		select {
+		case ch <- d:
+			timer.Stop()
+		case <-timer.C:
+			w.mu.Lock()
+			w.pending = append([]profileRawData{d}, w.pending...)
+			w.mu.Unlock()
+			return
+		}
 	}
 }
 

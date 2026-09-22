@@ -40,6 +40,10 @@ const (
 	sendPipelineDrainWait          = 15 * time.Second
 	profileSendTimeout             = 3 * time.Second
 	maxAbandonedProfileSends       = 2
+	// Bound open/retry loops in uploadProfileResults so a down backend cannot
+	// wedge the profile send goroutine (and thus Close) indefinitely.
+	maxShutdownStreamOpenAttempts = 30
+	maxShutdownProfileSendRetries = 30
 )
 
 // errProfileStreamAbandoned means Send is still in-flight on this stream; the
@@ -767,6 +771,7 @@ func (r *gRPCReporter) uploadProfileResults(tasks []reporter.ProfileResult) {
 		}
 	}()
 
+	sendRetries := 0
 	for len(tasks) > 0 {
 		if ps == nil || abandoned {
 			if !r.ensureShutdownProfileStream(&ps, &abandoned) {
@@ -783,6 +788,12 @@ func (r *gRPCReporter) uploadProfileResults(tasks []reporter.ProfileResult) {
 		sendErr := r.sendProfileDataWithTimeout(ps, profileData)
 		if sendErr != nil {
 			r.noteShutdownProfileSendFailure(&ps, &abandoned, sendErr)
+			sendRetries++
+			if sendRetries > maxShutdownProfileSendRetries {
+				r.logger.Errorf("shutdown profile flush: abandoning %d results after %d send retries",
+					len(tasks), sendRetries)
+				return
+			}
 			if r.connManager.Wait(100 * time.Millisecond) {
 				// Not fully shut down yet — reopen and retry the same chunk.
 				continue
@@ -796,6 +807,7 @@ func (r *gRPCReporter) uploadProfileResults(tasks []reporter.ProfileResult) {
 				return
 			}
 		}
+		sendRetries = 0
 		if task.IsLast {
 			r.finishProfileTask(task.TaskID)
 		}
@@ -804,7 +816,7 @@ func (r *gRPCReporter) uploadProfileResults(tasks []reporter.ProfileResult) {
 }
 
 func (r *gRPCReporter) ensureShutdownProfileStream(ps **profileStream, abandoned *bool) bool {
-	for {
+	for attempt := 0; attempt < maxShutdownStreamOpenAttempts; attempt++ {
 		if r.openShutdownProfileStream(ps, abandoned) {
 			return true
 		}
@@ -812,6 +824,7 @@ func (r *gRPCReporter) ensureShutdownProfileStream(ps **profileStream, abandoned
 			return r.openShutdownProfileStream(ps, abandoned)
 		}
 	}
+	return false
 }
 
 func (r *gRPCReporter) openShutdownProfileStream(ps **profileStream, abandoned *bool) bool {
@@ -845,23 +858,52 @@ func (r *gRPCReporter) drainRemainingProfileResults() {
 }
 
 func (r *gRPCReporter) closeTracingStream(stream agentv3.TraceSegmentReportService_CollectClient) {
-	_, err := stream.CloseAndRecv()
-	if err != nil && err != io.EOF {
-		r.logger.Errorf("send closing error %v", err)
-	}
+	r.closeStreamWithTimeout("trace", func() error {
+		_, err := stream.CloseAndRecv()
+		return err
+	}, nil)
 }
 
 func (r *gRPCReporter) closeMetricsStream(stream agentv3.MeterReportService_CollectBatchClient) {
-	_, err := stream.CloseAndRecv()
-	if err != nil && err != io.EOF {
-		r.logger.Errorf("send closing error %v", err)
-	}
+	r.closeStreamWithTimeout("metrics", func() error {
+		_, err := stream.CloseAndRecv()
+		return err
+	}, nil)
 }
 
 func (r *gRPCReporter) closeLogStream(stream logv3.LogReportService_CollectClient) {
-	_, err := stream.CloseAndRecv()
-	if err != nil && err != io.EOF {
-		r.logger.Errorf("send closing error %v", err)
+	r.closeStreamWithTimeout("log", func() error {
+		_, err := stream.CloseAndRecv()
+		return err
+	}, nil)
+}
+
+// closeStreamWithTimeout bounds CloseAndRecv so a stalled backend cannot consume
+// the entire sendPipelineDrainWait budget on shutdown.
+func (r *gRPCReporter) closeStreamWithTimeout(kind string, closeFn func() error, onTimeout func()) {
+	done := make(chan struct{})
+	var closeErr error
+	go func() {
+		defer close(done)
+		closeErr = closeFn()
+	}()
+	select {
+	case <-done:
+		if closeErr != nil && closeErr != io.EOF {
+			r.logger.Errorf("send %s closing error %v", kind, closeErr)
+		}
+	case <-time.After(profileSendTimeout):
+		if onTimeout != nil {
+			onTimeout()
+		}
+		select {
+		case <-done:
+			if closeErr != nil && closeErr != io.EOF {
+				r.logger.Errorf("send %s closing error %v", kind, closeErr)
+			}
+		case <-time.After(profileSendTimeout):
+			r.logger.Errorf("close %s stream timed out after %s", kind, profileSendTimeout)
+		}
 	}
 }
 
