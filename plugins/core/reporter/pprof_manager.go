@@ -96,7 +96,7 @@ type PprofTaskManager struct {
 	closed         bool // true once pprofSendCh is closed
 	// closingCh is closed when Close marks the manager closed, so trySendPprof
 	// can unblock instead of waiting forever on a full queue.
-	closingCh chan struct{}
+	closingCh      chan struct{}
 	sendPipelineWG sync.WaitGroup
 	// senderWG tracks trySendPprof callers that passed the !closed check so
 	// Close can wait for them to finish the blocking enqueue before closing
