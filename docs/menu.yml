@@ -42,6 +42,8 @@ catalog:
           path: /en/agent/plugin-configurations
         - name: Transport Layer Security (TLS)
           path: /en/advanced-features/grpc-tls
+        - name: Periodically Resolve Backend DNS
+          path: /en/advanced-features/periodic-dns
         - name: Kafka Reporter
           path: /en/advanced-features/kafka-reporter
         - name: Manual APIs

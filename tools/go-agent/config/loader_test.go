@@ -32,4 +32,8 @@ func TestLoadConfig(t *testing.T) {
 	assert.Equal(t, expected, conf.Agent.ServiceName)
 	expected = StringValue{EnvKey: "SW_AGENT_SAMPLE", Default: "0.1"}
 	assert.Equal(t, expected, conf.Agent.Sampler)
+	expected = StringValue{EnvKey: "SW_AGENT_REPORTER_GRPC_RESOLVE_DNS_PERIODICALLY", Default: "false"}
+	assert.Equal(t, expected, conf.Reporter.GRPC.ResolveDNSPeriodically)
+	expected = StringValue{EnvKey: "SW_AGENT_REPORTER_GRPC_RESOLVE_DNS_PERIOD", Default: "0"}
+	assert.Equal(t, expected, conf.Reporter.GRPC.ResolveDNSPeriod)
 }

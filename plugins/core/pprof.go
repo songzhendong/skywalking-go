@@ -44,7 +44,16 @@ const (
 )
 
 // CPU profiling state to ensure only one CPU profiling task runs at a time
+// (shared by pprof tasks and trace ProfileManager).
 var profilingIsRunning atomic.Bool
+
+func tryAcquireCPUProfiling() bool {
+	return profilingIsRunning.CompareAndSwap(false, true)
+}
+
+func releaseCPUProfiling() {
+	profilingIsRunning.Store(false)
+}
 
 func init() {
 	reporter.NewPprofTaskCommand = NewPprofTaskCommand
@@ -152,15 +161,15 @@ func (c *PprofTaskCommandImpl) getWriter() (io.Writer, error) {
 
 func (c *PprofTaskCommandImpl) StartTask() (io.Writer, error) {
 	c.logger.Infof("start pprof task %s", c.taskID)
-	// For CPU profiling, check global state first
-	if c.events == PprofEventsTypeCPU && !profilingIsRunning.CompareAndSwap(false, true) {
+	// For CPU profiling, check global state first (shared with ProfileManager).
+	if c.events == PprofEventsTypeCPU && !tryAcquireCPUProfiling() {
 		return nil, fmt.Errorf("CPU profiling is already running")
 	}
 
 	writer, err := c.getWriter()
 	if err != nil {
 		if c.events == PprofEventsTypeCPU {
-			profilingIsRunning.Store(false)
+			releaseCPUProfiling()
 		}
 		return nil, err
 	}
@@ -168,7 +177,7 @@ func (c *PprofTaskCommandImpl) StartTask() (io.Writer, error) {
 	switch c.events {
 	case PprofEventsTypeCPU:
 		if err = pprof.StartCPUProfile(writer); err != nil {
-			profilingIsRunning.Store(false)
+			releaseCPUProfiling()
 			if c.pprofFilePath != "" {
 				c.closeFileWriter(writer)
 			}
@@ -188,7 +197,7 @@ func (c *PprofTaskCommandImpl) StopTask(writer io.Writer) {
 	switch c.events {
 	case PprofEventsTypeCPU:
 		pprof.StopCPUProfile()
-		profilingIsRunning.Store(false)
+		releaseCPUProfiling()
 	case PprofEventsTypeBlock:
 		if err := pprof.Lookup("block").WriteTo(writer, 0); err != nil {
 			c.logger.Errorf("write Block profile error %v", err)

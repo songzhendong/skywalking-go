@@ -19,7 +19,9 @@ package grpc
 
 import (
 	"context"
+	"errors"
 	"io"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc/metadata"
@@ -34,8 +36,43 @@ import (
 )
 
 const (
-	maxSendQueueSize int32 = 30000
+	maxSendQueueSize         int32 = 30000
+	sendPipelineDrainWait          = 15 * time.Second
+	profileSendTimeout             = 3 * time.Second
+	maxAbandonedProfileSends       = 2
+	// Bound open/retry loops in uploadProfileResults so a down backend cannot
+	// wedge the profile send goroutine (and thus Close) indefinitely.
+	maxShutdownStreamOpenAttempts = 30
+	maxShutdownProfileSendRetries = 30
 )
+
+// errProfileStreamAbandoned means Send is still in-flight on this stream; the
+// caller must not CloseAndRecv/Send further on it. At most
+// maxAbandonedProfileSends such streams may be abandoned concurrently; when the
+// soft-cap is reached we cancel and wait for Send instead of leaking another
+// waiter/stream.
+var errProfileStreamAbandoned = errors.New("profile stream abandoned with in-flight send")
+
+// errProfileSendPanic means stream.Send panicked, so the chunk was not delivered.
+var errProfileSendPanic = errors.New("profile stream send panicked")
+
+// maxProfileChunkRetries bounds how many streams one chunk may be retried on, so
+// a chunk the backend keeps rejecting cannot wedge the profile pipeline.
+const maxProfileChunkRetries = 3
+
+// profileStream owns a GoProfileReport client stream and its cancel func.
+// The cancel must outlive openProfileStream — it governs the whole RPC.
+type profileStream struct {
+	client profilev3.ProfileTask_GoProfileReportClient
+	cancel context.CancelFunc
+}
+
+func (s *profileStream) Send(data *profilev3.GoProfileData) error {
+	if s == nil || s.client == nil {
+		return errors.New("nil profile stream")
+	}
+	return s.client.Send(data)
+}
 
 // NewGRPCReporter create a new reporter to send data to gRPC oap server. Only one backend address is allowed.
 func NewGRPCReporter(logger operator.LogOperator,
@@ -98,6 +135,14 @@ type gRPCReporter struct {
 	connManager      *reporter.ConnectionManager
 	cdsManager       *reporter.CDSManager
 	pprofTaskManager *reporter.PprofTaskManager
+
+	closeOnce      sync.Once
+	sendPipelineWG sync.WaitGroup
+
+	// abandonedProfileSends caps in-flight Sends left on abandoned streams so a
+	// stuck backend cannot accumulate unbounded goroutines/streams.
+	abandonedProfileMu    sync.Mutex
+	abandonedProfileSends int
 }
 
 func (r *gRPCReporter) Boot(entity *reporter.Entity, cdsWatchers []reporter.AgentConfigChangeWatcher) {
@@ -167,21 +212,58 @@ func (r *gRPCReporter) SendLog(log *logv3.LogData) {
 }
 
 func (r *gRPCReporter) Close() {
-	if r.bootFlag {
-		if r.tracingSendCh != nil {
-			close(r.tracingSendCh)
+	r.closeOnce.Do(func() {
+		// Wake disconnect/retry sleeps first so pipelines can leave Wait promptly,
+		// while ClientConns stay open for the drain below.
+		if r.connManager != nil {
+			r.connManager.SignalShutdown()
 		}
-		if r.metricsSendCh != nil {
-			close(r.metricsSendCh)
+		if r.bootFlag {
+			// Stop the profile producer and close its results channel so the
+			// profile send pipeline can drain buffered results then exit.
+			// Close is optional for source compatibility with external
+			// ProfileTaskManager implementations that predate the method.
+			if c, ok := r.profileTaskManager.(reporter.ProfileTaskManagerCloser); ok {
+				c.Close()
+			}
+			if r.tracingSendCh != nil {
+				close(r.tracingSendCh)
+			}
+			if r.metricsSendCh != nil {
+				close(r.metricsSendCh)
+			}
+			if r.logSendCh != nil {
+				close(r.logSendCh)
+			}
+			if r.pprofTaskManager != nil {
+				r.pprofTaskManager.Close()
+			}
+			done := make(chan struct{})
+			go func() {
+				r.sendPipelineWG.Wait()
+				if r.pprofTaskManager != nil {
+					r.pprofTaskManager.WaitSendPipeline()
+				}
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(sendPipelineDrainWait):
+				if r.logger != nil {
+					r.logger.Errorf("gRPCReporter Close: send pipelines did not finish within %s", sendPipelineDrainWait)
+				}
+			}
 		}
-	} else {
 		r.closeGRPCConn()
-	}
+	})
 }
 
+// closeGRPCConn force-closes the shared connection because other components
+// (CDS, pprof) hold their own references; any remaining reference would keep
+// the ClientConn - and the periodic DNS resolver it owns - alive.
 func (r *gRPCReporter) closeGRPCConn() {
-	if err := r.connManager.ReleaseConnection(r.serverAddr); err != nil {
-		r.logger.Error(err)
+	if r.connManager != nil {
+		r.connManager.Close()
 	}
 }
 
@@ -211,7 +293,9 @@ func (r *gRPCReporter) initSendPipeline() {
 	if r.traceClient == nil {
 		return
 	}
+	r.sendPipelineWG.Add(4)
 	go func() {
+		defer r.sendPipelineWG.Done()
 		defer func() {
 			if err := recover(); err != nil {
 				r.logger.Errorf("gRPCReporter initSendPipeline trace client Collect panic err %v", err)
@@ -221,16 +305,20 @@ func (r *gRPCReporter) initSendPipeline() {
 		for {
 			switch r.connManager.GetConnectionStatus(r.serverAddr) {
 			case reporter.ConnectionStatusShutdown:
-				break
+				break StreamLoop
 			case reporter.ConnectionStatusDisconnect:
-				time.Sleep(5 * time.Second)
-				continue StreamLoop
+				if r.connManager.Wait(5 * time.Second) {
+					continue StreamLoop
+				}
+				// Shutdown signaled while disconnected: try one flush pass below.
 			}
 
 			stream, err := r.traceClient.Collect(metadata.NewOutgoingContext(context.Background(), r.connManager.GetMD()))
 			if err != nil {
 				r.logger.Errorf("open stream error %v", err)
-				time.Sleep(5 * time.Second)
+				if !r.connManager.Wait(5 * time.Second) {
+					break StreamLoop
+				}
 				continue StreamLoop
 			}
 			for s := range r.tracingSendCh {
@@ -245,11 +333,11 @@ func (r *gRPCReporter) initSendPipeline() {
 				}
 			}
 			r.closeTracingStream(stream)
-			r.closeGRPCConn()
-			break
+			break StreamLoop
 		}
 	}()
 	go func() {
+		defer r.sendPipelineWG.Done()
 		defer func() {
 			if err := recover(); err != nil {
 				r.logger.Errorf("gRPCReporter initSendPipeline metrics client CollectBatch panic err %v", err)
@@ -259,16 +347,19 @@ func (r *gRPCReporter) initSendPipeline() {
 		for {
 			switch r.connManager.GetConnectionStatus(r.serverAddr) {
 			case reporter.ConnectionStatusShutdown:
-				break
+				break StreamLoop
 			case reporter.ConnectionStatusDisconnect:
-				time.Sleep(5 * time.Second)
-				continue StreamLoop
+				if r.connManager.Wait(5 * time.Second) {
+					continue StreamLoop
+				}
 			}
 
 			stream, err := r.metricsClient.CollectBatch(metadata.NewOutgoingContext(context.Background(), r.connManager.GetMD()))
 			if err != nil {
 				r.logger.Errorf("open stream error %v", err)
-				time.Sleep(5 * time.Second)
+				if !r.connManager.Wait(5 * time.Second) {
+					break StreamLoop
+				}
 				continue StreamLoop
 			}
 			for s := range r.metricsSendCh {
@@ -285,10 +376,11 @@ func (r *gRPCReporter) initSendPipeline() {
 				}
 			}
 			r.closeMetricsStream(stream)
-			break
+			break StreamLoop
 		}
 	}()
 	go func() {
+		defer r.sendPipelineWG.Done()
 		defer func() {
 			if err := recover(); err != nil {
 				r.logger.Errorf("gRPCReporter initSendPipeline log client Collect panic err %v", err)
@@ -298,16 +390,19 @@ func (r *gRPCReporter) initSendPipeline() {
 		for {
 			switch r.connManager.GetConnectionStatus(r.serverAddr) {
 			case reporter.ConnectionStatusShutdown:
-				break
+				break StreamLoop
 			case reporter.ConnectionStatusDisconnect:
-				time.Sleep(5 * time.Second)
-				continue StreamLoop
+				if r.connManager.Wait(5 * time.Second) {
+					continue StreamLoop
+				}
 			}
 
 			stream, err := r.logClient.Collect(metadata.NewOutgoingContext(context.Background(), r.connManager.GetMD()))
 			if err != nil {
 				r.logger.Errorf("open stream error %v", err)
-				time.Sleep(5 * time.Second)
+				if !r.connManager.Wait(5 * time.Second) {
+					break StreamLoop
+				}
 				continue StreamLoop
 			}
 			for s := range r.logSendCh {
@@ -322,94 +417,525 @@ func (r *gRPCReporter) initSendPipeline() {
 				}
 			}
 			r.closeLogStream(stream)
-			break
+			break StreamLoop
 		}
 	}()
 	go func() {
-		defer func() {
-			if err := recover(); err != nil {
-				r.logger.Errorf("gRPCReporter reportProfileResult panic err %v", err)
-			}
-		}()
-
-	StreamLoop:
+		defer r.sendPipelineWG.Done()
+		if r.profileTaskManager == nil || r.profileTaskClient == nil {
+			return
+		}
 		for {
-			switch r.connManager.GetConnectionStatus(r.serverAddr) {
-			case reporter.ConnectionStatusShutdown:
-				break
-			case reporter.ConnectionStatusDisconnect:
-				time.Sleep(5 * time.Second)
-				continue StreamLoop
-			}
-
-			stream, err := r.profileTaskClient.GoProfileReport(metadata.NewOutgoingContext(context.Background(), r.connManager.GetMD()))
-			if err != nil {
-				r.logger.Errorf("open profile stream error %v", err)
-				time.Sleep(5 * time.Second)
-				continue StreamLoop
-			}
-			re := r.profileTaskManager.GetProfileResults()
-
-			for task := range re {
-				profileData := &profilev3.GoProfileData{
-					TaskId:  task.TaskID,
-					Payload: task.Payload,
-					IsLast:  task.IsLast,
-				}
-				r.logger.Infof("Sending profile task: TaskID='%s', PayloadSize=%d, IsLast=%v",
-					task.TaskID, len(task.Payload), task.IsLast)
-				recovered, sendErr := r.sendWithRecover(func() error { return stream.Send(profileData) })
-				if recovered {
-					continue
-				}
-				if sendErr != nil {
-					r.logger.Errorf("send profile data error %v", sendErr)
-					r.closeProfileStream(stream)
-					continue StreamLoop
-				}
-				if task.IsLast {
-					r.profileTaskManager.ProfileFinish()
-					var report = profilev3.ProfileTaskFinishReport{
-						TaskId:          task.TaskID,
-						Service:         r.entity.ServiceName,
-						ServiceInstance: r.entity.ServiceInstanceName,
+			panicked := false
+			func() {
+				defer func() {
+					if err := recover(); err != nil {
+						r.logger.Errorf("gRPCReporter reportProfileResult panic err %v", err)
+						panicked = true
 					}
-					_, err = r.profileTaskClient.ReportTaskFinish(metadata.NewOutgoingContext(context.Background(), r.connManager.GetMD()), &report)
-					if err != nil {
-						r.logger.Errorf("report profile task finish error %v", err)
-					}
-				}
+				}()
+				r.runProfileSendLoop()
+			}()
+			if !panicked {
+				return
 			}
-			r.closeProfileStream(stream)
-			break
+			// Keep a drain path alive after panic so ProfileManager.Close cannot
+			// block forever in flushOverflowBlocking.
+			select {
+			case <-r.connManager.ShutdownNotify():
+				r.flushProfileResultsBestEffort()
+				return
+			case <-time.After(time.Second):
+			}
 		}
 	}()
 }
 
-func (r *gRPCReporter) closeTracingStream(stream agentv3.TraceSegmentReportService_CollectClient) {
-	_, err := stream.CloseAndRecv()
-	if err != nil && err != io.EOF {
-		r.logger.Errorf("send closing error %v", err)
+func (r *gRPCReporter) runProfileSendLoop() {
+	shutdownCh := r.connManager.ShutdownNotify()
+	var pendingSend *reporter.ProfileResult
+	pendingRetries := 0
+
+	for {
+		if r.shouldFlushProfileAndExit(shutdownCh, pendingSend) {
+			return
+		}
+
+		ps, err := r.openProfileStream()
+		if err != nil {
+			r.logger.Errorf("open profile stream error %v", err)
+			if !r.connManager.Wait(5 * time.Second) {
+				r.flushPendingProfile(pendingSend)
+				return
+			}
+			continue
+		}
+		re := r.profileTaskManager.GetProfileResults()
+
+		for {
+			task, ok, cont := r.nextProfileTask(shutdownCh, ps, re, &pendingSend)
+			if !ok {
+				return
+			}
+			if cont {
+				continue
+			}
+
+			profileData := &profilev3.GoProfileData{
+				TaskId:  task.TaskID,
+				Payload: task.Payload,
+				IsLast:  task.IsLast,
+			}
+			r.logger.Infof("Sending profile task: TaskID='%s', PayloadSize=%d, IsLast=%v",
+				task.TaskID, len(task.Payload), task.IsLast)
+			sendErr := r.sendProfileDataWithTimeout(ps, profileData)
+			if sendErr != nil {
+				if r.handleProfileSendFailure(shutdownCh, ps, sendErr, task, &pendingSend, &pendingRetries) {
+					return
+				}
+				break
+			}
+			pendingRetries = 0
+			if task.IsLast {
+				r.finishProfileTask(task.TaskID)
+			}
+		}
 	}
+}
+
+func (r *gRPCReporter) flushPendingProfile(pending *reporter.ProfileResult) {
+	if pending != nil {
+		r.flushProfileResultsBestEffort(*pending)
+		return
+	}
+	r.flushProfileResultsBestEffort()
+}
+
+func (r *gRPCReporter) shouldFlushProfileAndExit(shutdownCh <-chan struct{}, pending *reporter.ProfileResult) bool {
+	select {
+	case <-shutdownCh:
+		r.flushPendingProfile(pending)
+		return true
+	default:
+	}
+	switch r.connManager.GetConnectionStatus(r.serverAddr) {
+	case reporter.ConnectionStatusShutdown:
+		r.flushPendingProfile(pending)
+		return true
+	case reporter.ConnectionStatusDisconnect:
+		if r.connManager.Wait(5 * time.Second) {
+			return false
+		}
+		r.flushPendingProfile(pending)
+		return true
+	}
+	return false
+}
+
+// nextProfileTask returns the next chunk to send.
+// ok=false means the loop should exit; cont=true means retry the select.
+func (r *gRPCReporter) nextProfileTask(
+	shutdownCh <-chan struct{},
+	ps *profileStream,
+	re <-chan reporter.ProfileResult,
+	pendingSend **reporter.ProfileResult,
+) (task reporter.ProfileResult, ok, cont bool) {
+	if *pendingSend != nil {
+		task = **pendingSend
+		*pendingSend = nil
+		return task, true, false
+	}
+	select {
+	case <-shutdownCh:
+		r.flushProfileResultsBestEffort()
+		if ps != nil {
+			r.closeProfileStream(ps)
+		}
+		return task, false, false
+	case got, open := <-re:
+		if !open {
+			if ps != nil {
+				r.closeProfileStream(ps)
+			}
+			return task, false, false
+		}
+		return got, true, false
+	case <-time.After(time.Second):
+		if r.connManager.GetConnectionStatus(r.serverAddr) == reporter.ConnectionStatusShutdown {
+			r.flushProfileResultsBestEffort()
+			if ps != nil {
+				r.closeProfileStream(ps)
+			}
+			return task, false, false
+		}
+		return task, true, true
+	}
+}
+
+// handleProfileSendFailure closes or abandons the stream and requeues the chunk.
+// Returns true when the send loop should exit (shutdown).
+func (r *gRPCReporter) handleProfileSendFailure(
+	shutdownCh <-chan struct{},
+	ps *profileStream,
+	sendErr error,
+	task reporter.ProfileResult,
+	pendingSend **reporter.ProfileResult,
+	pendingRetries *int,
+) bool {
+	r.logger.Errorf("send profile data error %v", sendErr)
+	if !errors.Is(sendErr, errProfileStreamAbandoned) {
+		r.closeProfileStream(ps)
+	}
+	select {
+	case <-shutdownCh:
+		r.flushProfileResultsBestEffort(task)
+		return true
+	default:
+	}
+	*pendingRetries++
+	if *pendingRetries > maxProfileChunkRetries {
+		r.logger.Errorf("stream retries exhausted for profile task %s after %d attempts; uploading via flush path",
+			task.TaskID, *pendingRetries-1)
+		*pendingRetries = 0
+		// Do not drop: try a dedicated upload so IsLast cannot vanish while the
+		// results channel is still open.
+		r.uploadProfileResults([]reporter.ProfileResult{task})
+		return false
+	}
+	cp := task
+	*pendingSend = &cp
+	return false
+}
+
+// openProfileStream opens a profile upload stream. The returned cancel must be
+// invoked from closeProfileStream (or after abandon + Conn teardown) — it must
+// NOT be deferred in this function or the stream dies immediately.
+func (r *gRPCReporter) openProfileStream() (*profileStream, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	type openRes struct {
+		client profilev3.ProfileTask_GoProfileReportClient
+		err    error
+	}
+	ch := make(chan openRes, 1)
+	go func() {
+		client, err := r.profileTaskClient.GoProfileReport(metadata.NewOutgoingContext(ctx, r.connManager.GetMD()))
+		ch <- openRes{client: client, err: err}
+	}()
+	select {
+	case res := <-ch:
+		if res.err != nil {
+			cancel()
+			return nil, res.err
+		}
+		return &profileStream{client: res.client, cancel: cancel}, nil
+	case <-time.After(profileSendTimeout):
+		cancel()
+		go func() {
+			res := <-ch
+			if res.client != nil {
+				_, _ = res.client.CloseAndRecv()
+			}
+		}()
+		return nil, context.DeadlineExceeded
+	}
+}
+
+// sendProfileDataWithTimeout bounds how long we wait for stream.Send so a stuck
+// backend cannot block the receive loop forever. If the wait expires while Send
+// is still running, the stream is abandoned (do not CloseAndRecv) to avoid
+// racing Send. When the abandon soft-cap is reached, cancel and wait for Send
+// instead of leaking another waiter. If ShutdownNotify and done are both ready,
+// prefer the completed Send result.
+func (r *gRPCReporter) sendProfileDataWithTimeout(ps *profileStream, data *profilev3.GoProfileData) error {
+	if ps == nil {
+		return errors.New("nil profile stream")
+	}
+	done := make(chan error, 1)
+	go func() {
+		recovered, sendErr := r.sendWithRecover(func() error { return ps.Send(data) })
+		if recovered {
+			// A panicking Send delivered nothing: report failure so the caller
+			// reopens the stream and requeues instead of losing the chunk.
+			done <- errProfileSendPanic
+			return
+		}
+		done <- sendErr
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-r.connManager.ShutdownNotify():
+		// Prefer a completed Send when both are ready (select is random otherwise).
+		select {
+		case err := <-done:
+			return err
+		default:
+			return r.finishOrAbandonProfileSend(done, ps.cancel)
+		}
+	case <-time.After(profileSendTimeout):
+		select {
+		case err := <-done:
+			return err
+		default:
+			return r.finishOrAbandonProfileSend(done, ps.cancel)
+		}
+	}
+}
+
+func (r *gRPCReporter) finishOrAbandonProfileSend(done <-chan error, cancel context.CancelFunc) error {
+	r.abandonedProfileMu.Lock()
+	canAbandon := r.abandonedProfileSends < maxAbandonedProfileSends
+	if canAbandon {
+		r.abandonedProfileSends++
+	}
+	r.abandonedProfileMu.Unlock()
+
+	if !canAbandon {
+		// Soft-cap reached: cancel to unblock Send and wait. Do not spawn another
+		// abandon waiter — that would leak goroutines/streams unboundedly.
+		if cancel != nil {
+			cancel()
+		}
+		return <-done
+	}
+
+	// Cancel promptly so gRPC can finish Send and free the soft-cap slot.
+	if cancel != nil {
+		cancel()
+	}
+	go func() {
+		<-done
+		r.abandonedProfileMu.Lock()
+		if r.abandonedProfileSends > 0 {
+			r.abandonedProfileSends--
+		}
+		r.abandonedProfileMu.Unlock()
+	}()
+	return errProfileStreamAbandoned
+}
+
+func (r *gRPCReporter) finishProfileTask(taskID string) {
+	if r.profileTaskManager != nil {
+		r.profileTaskManager.ProfileFinish()
+	}
+	if r.profileTaskClient == nil || r.entity == nil {
+		return
+	}
+	report := profilev3.ProfileTaskFinishReport{
+		TaskId:          taskID,
+		Service:         r.entity.ServiceName,
+		ServiceInstance: r.entity.ServiceInstanceName,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), profileSendTimeout)
+	defer cancel()
+	_, err := r.profileTaskClient.ReportTaskFinish(metadata.NewOutgoingContext(ctx, r.connManager.GetMD()), &report)
+	if err != nil {
+		r.logger.Errorf("report profile task finish error %v", err)
+	}
+}
+
+// flushProfileResultsBestEffort uploads remaining profile chunks on shutdown.
+// Failed sends are kept and retried after the producer channel is drained so
+// ProfileManager.Close (flushOverflowBlocking) cannot deadlock on a full buffer.
+// Results are only abandoned after shutdown retries are exhausted.
+// extra holds chunks already dequeued (e.g. abandoned in-flight Send) so they
+// are not lost before the channel drain.
+func (r *gRPCReporter) flushProfileResultsBestEffort(extra ...reporter.ProfileResult) {
+	if r.profileTaskManager == nil || r.profileTaskClient == nil {
+		return
+	}
+	re := r.profileTaskManager.GetProfileResults()
+	if re == nil {
+		if len(extra) > 0 {
+			r.uploadProfileResults(append([]reporter.ProfileResult(nil), extra...))
+		}
+		return
+	}
+
+	pending := append([]reporter.ProfileResult(nil), extra...)
+	for task := range re {
+		pending = append(pending, task)
+	}
+	r.uploadProfileResults(pending)
+}
+
+func (r *gRPCReporter) uploadProfileResults(tasks []reporter.ProfileResult) {
+	if len(tasks) == 0 {
+		return
+	}
+	var ps *profileStream
+	var abandoned bool
+	defer func() {
+		if ps != nil && !abandoned {
+			r.closeProfileStream(ps)
+		}
+	}()
+
+	sendRetries := 0
+	for len(tasks) > 0 {
+		if ps == nil || abandoned {
+			if !r.ensureShutdownProfileStream(&ps, &abandoned) {
+				r.logger.Errorf("shutdown profile flush: abandoning %d results (no stream)", len(tasks))
+				return
+			}
+		}
+		task := tasks[0]
+		profileData := &profilev3.GoProfileData{
+			TaskId:  task.TaskID,
+			Payload: task.Payload,
+			IsLast:  task.IsLast,
+		}
+		sendErr := r.sendProfileDataWithTimeout(ps, profileData)
+		if sendErr != nil {
+			r.noteShutdownProfileSendFailure(&ps, &abandoned, sendErr)
+			sendRetries++
+			if sendRetries > maxShutdownProfileSendRetries {
+				r.logger.Errorf("shutdown profile flush: abandoning %d results after %d send retries",
+					len(tasks), sendRetries)
+				return
+			}
+			if r.connManager.Wait(100 * time.Millisecond) {
+				// Not fully shut down yet — reopen and retry the same chunk.
+				continue
+			}
+			if ps == nil && !r.openShutdownProfileStream(&ps, &abandoned) {
+				r.logger.Errorf("shutdown profile flush: abandoning %d results after send errors", len(tasks))
+				return
+			}
+			if r.sendProfileDataWithTimeout(ps, profileData) != nil {
+				r.logger.Errorf("shutdown profile flush: abandoning %d results: %v", len(tasks), sendErr)
+				return
+			}
+		}
+		sendRetries = 0
+		if task.IsLast {
+			r.finishProfileTask(task.TaskID)
+		}
+		tasks = tasks[1:]
+	}
+}
+
+func (r *gRPCReporter) ensureShutdownProfileStream(ps **profileStream, abandoned *bool) bool {
+	for attempt := 0; attempt < maxShutdownStreamOpenAttempts; attempt++ {
+		if r.openShutdownProfileStream(ps, abandoned) {
+			return true
+		}
+		if !r.connManager.Wait(100 * time.Millisecond) {
+			return r.openShutdownProfileStream(ps, abandoned)
+		}
+	}
+	return false
+}
+
+func (r *gRPCReporter) openShutdownProfileStream(ps **profileStream, abandoned *bool) bool {
+	s, err := r.openProfileStream()
+	if err != nil {
+		r.logger.Errorf("open profile stream for shutdown flush error %v", err)
+		return false
+	}
+	*ps = s
+	*abandoned = false
+	return true
+}
+
+func (r *gRPCReporter) noteShutdownProfileSendFailure(ps **profileStream, abandoned *bool, sendErr error) {
+	r.logger.Errorf("shutdown profile flush send error %v", sendErr)
+	if errors.Is(sendErr, errProfileStreamAbandoned) {
+		*abandoned = true
+		*ps = nil
+		return
+	}
+	if *ps != nil {
+		r.closeProfileStream(*ps)
+		*ps = nil
+	}
+}
+
+// drainRemainingProfileResults consumes any leftover profile results after the
+// producer has closed the channel (or when shutdown prevents opening a stream).
+func (r *gRPCReporter) drainRemainingProfileResults() {
+	r.flushProfileResultsBestEffort()
+}
+
+func (r *gRPCReporter) closeTracingStream(stream agentv3.TraceSegmentReportService_CollectClient) {
+	r.closeStreamWithTimeout("trace", func() error {
+		_, err := stream.CloseAndRecv()
+		return err
+	}, nil)
 }
 
 func (r *gRPCReporter) closeMetricsStream(stream agentv3.MeterReportService_CollectBatchClient) {
-	_, err := stream.CloseAndRecv()
-	if err != nil && err != io.EOF {
-		r.logger.Errorf("send closing error %v", err)
-	}
+	r.closeStreamWithTimeout("metrics", func() error {
+		_, err := stream.CloseAndRecv()
+		return err
+	}, nil)
 }
 
 func (r *gRPCReporter) closeLogStream(stream logv3.LogReportService_CollectClient) {
-	_, err := stream.CloseAndRecv()
-	if err != nil && err != io.EOF {
-		r.logger.Errorf("send closing error %v", err)
+	r.closeStreamWithTimeout("log", func() error {
+		_, err := stream.CloseAndRecv()
+		return err
+	}, nil)
+}
+
+// closeStreamWithTimeout bounds CloseAndRecv so a stalled backend cannot consume
+// the entire sendPipelineDrainWait budget on shutdown.
+func (r *gRPCReporter) closeStreamWithTimeout(kind string, closeFn func() error, onTimeout func()) {
+	done := make(chan struct{})
+	var closeErr error
+	go func() {
+		defer close(done)
+		closeErr = closeFn()
+	}()
+	select {
+	case <-done:
+		if closeErr != nil && closeErr != io.EOF {
+			r.logger.Errorf("send %s closing error %v", kind, closeErr)
+		}
+	case <-time.After(profileSendTimeout):
+		if onTimeout != nil {
+			onTimeout()
+		}
+		select {
+		case <-done:
+			if closeErr != nil && closeErr != io.EOF {
+				r.logger.Errorf("send %s closing error %v", kind, closeErr)
+			}
+		case <-time.After(profileSendTimeout):
+			r.logger.Errorf("close %s stream timed out after %s", kind, profileSendTimeout)
+		}
 	}
 }
-func (r *gRPCReporter) closeProfileStream(stream profilev3.ProfileTask_GoProfileReportClient) {
-	_, err := stream.CloseAndRecv()
-	if err != nil && err != io.EOF {
-		r.logger.Errorf("send profile closing error %v", err)
+
+func (r *gRPCReporter) closeProfileStream(ps *profileStream) {
+	if ps == nil {
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if ps.client != nil {
+			_, err := ps.client.CloseAndRecv()
+			if err != nil && err != io.EOF {
+				r.logger.Errorf("send profile closing error %v", err)
+			}
+		}
+		if ps.cancel != nil {
+			ps.cancel()
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(profileSendTimeout):
+		// Cancel the stream context to unblock CloseAndRecv, then wait briefly.
+		if ps.cancel != nil {
+			ps.cancel()
+		}
+		select {
+		case <-done:
+		case <-time.After(profileSendTimeout):
+			r.logger.Errorf("close profile stream timed out after %s", profileSendTimeout)
+		}
 	}
 }
 func (r *gRPCReporter) reportInstanceProperties() (err error) {
@@ -437,9 +963,11 @@ func (r *gRPCReporter) check() {
 		for {
 			switch r.connManager.GetConnectionStatus(r.serverAddr) {
 			case reporter.ConnectionStatusShutdown:
-				break
+				return
 			case reporter.ConnectionStatusDisconnect:
-				time.Sleep(r.checkInterval)
+				if !r.connManager.Wait(r.checkInterval) {
+					return
+				}
 				continue
 			}
 
@@ -447,7 +975,9 @@ func (r *gRPCReporter) check() {
 				err := r.reportInstanceProperties()
 				if err != nil {
 					r.logger.Errorf("report serviceInstance properties error %v", err)
-					time.Sleep(r.checkInterval)
+					if !r.connManager.Wait(r.checkInterval) {
+						return
+					}
 					continue
 				}
 				instancePropertiesSubmitted = true
@@ -463,7 +993,9 @@ func (r *gRPCReporter) check() {
 			if err != nil {
 				r.logger.Errorf("send keep alive signal error %v", err)
 			}
-			time.Sleep(r.checkInterval)
+			if !r.connManager.Wait(r.checkInterval) {
+				return
+			}
 		}
 	}()
 }
@@ -475,6 +1007,15 @@ func (r *gRPCReporter) fetchProfileTasks() {
 	}
 	go func() {
 		for {
+			switch r.connManager.GetConnectionStatus(r.serverAddr) {
+			case reporter.ConnectionStatusShutdown:
+				return
+			case reporter.ConnectionStatusDisconnect:
+				if !r.connManager.Wait(r.profileFetchInterval) {
+					return
+				}
+				continue
+			}
 			// The recover wraps a single iteration: this long-lived goroutine
 			// has no other protection and a panic while handling the profile
 			// commands would otherwise kill the whole process.
@@ -486,7 +1027,9 @@ func (r *gRPCReporter) fetchProfileTasks() {
 				}()
 				r.fetchProfileTasksOnce()
 			}()
-			time.Sleep(r.profileFetchInterval)
+			if !r.connManager.Wait(r.profileFetchInterval) {
+				return
+			}
 		}
 	}()
 }

@@ -211,6 +211,9 @@ const initManagerFunc = `
 func initManager(logger operator.LogOperator, checkInterval time.Duration) (*ConnectionManager, *CDSManager, *PprofTaskManager, error) {
 	authenticationVal := {{.Config.Reporter.GRPC.Authentication.ToGoStringValue}}
 	backendServiceVal := {{.Config.Reporter.GRPC.BackendService.ToGoStringValue}}
+	resolveDNSPeriodicallyVal := {{.Config.Reporter.GRPC.ResolveDNSPeriodically.ToGoBoolValue}}
+	resolveDNSPeriodVal := {{.Config.Reporter.GRPC.ResolveDNSPeriod.ToGoIntValue "the GRPC reporter resolve DNS period must be number"}}
+	resolveDNSPeriod := time.Second * time.Duration(resolveDNSPeriodVal)
 
 	var (
 		connManager *ConnectionManager
@@ -224,9 +227,13 @@ func initManager(logger operator.LogOperator, checkInterval time.Duration) (*Con
 		if err != nil {
 			panic(fmt.Sprintf("generate go agent tls credential error: %v", err))
 		}
-		connManager, err = NewConnectionManager(logger, checkInterval, backendServiceVal, authenticationVal, tc)
+		connManager, err = NewConnectionManager(logger, checkInterval, backendServiceVal,
+			authenticationVal, tc, WithPeriodicDNSResolver(resolveDNSPeriodicallyVal),
+			WithPeriodicDNSResolveInterval(resolveDNSPeriod))
 	} else {
-		connManager, err = NewConnectionManager(logger, checkInterval, backendServiceVal, authenticationVal, nil)
+		connManager, err = NewConnectionManager(logger, checkInterval, backendServiceVal,
+			authenticationVal, nil, WithPeriodicDNSResolver(resolveDNSPeriodicallyVal),
+			WithPeriodicDNSResolveInterval(resolveDNSPeriod))
 	}
 	if err != nil {
 		return nil, nil, nil, err

@@ -106,29 +106,109 @@ func DeletePackageImports(file dst.Node, imports ...string) {
 }
 
 func RemovePackageRef(parent dst.Node, current *dst.SelectorExpr, inx int) {
+	ident := dst.NewIdent(current.Sel.Name)
+	if replaceSimpleSelectorParent(parent, ident) {
+		return
+	}
+	replaceComplexSelectorParent(parent, current, ident, inx)
+}
+
+// replaceSimpleSelectorParent handles parents that only need Type/X/Elt/Value set once.
+func replaceSimpleSelectorParent(parent dst.Node, ident *dst.Ident) bool {
 	switch p := parent.(type) {
 	case *dst.Field:
-		p.Type = dst.NewIdent(current.Sel.Name)
+		p.Type = ident
 	case *dst.Ellipsis:
-		p.Elt = dst.NewIdent(current.Sel.Name)
+		p.Elt = ident
 	case *dst.StarExpr:
-		p.X = dst.NewIdent(current.Sel.Name)
+		p.X = ident
 	case *dst.TypeAssertExpr:
-		p.Type = dst.NewIdent(current.Sel.Name)
+		p.Type = ident
 	case *dst.CompositeLit:
-		p.Type = dst.NewIdent(current.Sel.Name)
+		p.Type = ident
 	case *dst.ArrayType:
-		p.Elt = dst.NewIdent(current.Sel.Name)
+		p.Elt = ident
 	case *dst.ChanType:
-		p.Value = dst.NewIdent(current.Sel.Name)
+		p.Value = ident
+	case *dst.UnaryExpr:
+		p.X = ident
+	case *dst.ParenExpr:
+		p.X = ident
+	case *dst.ExprStmt:
+		p.X = ident
+	default:
+		return false
+	}
+	return true
+}
+
+func replaceComplexSelectorParent(parent dst.Node, current *dst.SelectorExpr, ident *dst.Ident, inx int) {
+	switch p := parent.(type) {
 	case *dst.CallExpr:
-		p.Fun = dst.NewIdent(current.Sel.Name)
+		replaceSelectorInCall(p, current, ident)
 	case *dst.KeyValueExpr:
-		p.Value = dst.NewIdent(current.Sel.Name)
+		replaceSelectorInKeyValue(p, current, ident)
 	case *dst.AssignStmt:
-		p.Rhs = []dst.Expr{dst.NewIdent(current.Sel.Name)}
+		replaceSelectorInAssign(p, current, ident)
 	case *dst.CaseClause:
-		p.List[inx] = dst.NewIdent(current.Sel.Name)
+		p.List[inx] = ident
+	case *dst.ValueSpec:
+		replaceSelectorInValueSpec(p, current, ident)
+	case *dst.BinaryExpr:
+		replaceSelectorInBinary(p, current, ident)
+	case *dst.ReturnStmt:
+		replaceExprInSlice(p.Results, current, ident)
+	}
+}
+
+func replaceExprInSlice(exprs []dst.Expr, current *dst.SelectorExpr, ident *dst.Ident) bool {
+	for i, e := range exprs {
+		if e == current {
+			exprs[i] = ident
+			return true
+		}
+	}
+	return false
+}
+
+func replaceSelectorInCall(p *dst.CallExpr, current *dst.SelectorExpr, ident *dst.Ident) {
+	if p.Fun == current {
+		p.Fun = ident
+		return
+	}
+	replaceExprInSlice(p.Args, current, ident)
+}
+
+func replaceSelectorInKeyValue(p *dst.KeyValueExpr, current *dst.SelectorExpr, ident *dst.Ident) {
+	if p.Key == current {
+		p.Key = ident
+	} else if p.Value == current {
+		p.Value = ident
+	}
+}
+
+func replaceSelectorInAssign(p *dst.AssignStmt, current *dst.SelectorExpr, ident *dst.Ident) {
+	if replaceExprInSlice(p.Rhs, current, ident) {
+		return
+	}
+	replaceExprInSlice(p.Lhs, current, ident)
+}
+
+func replaceSelectorInValueSpec(p *dst.ValueSpec, current *dst.SelectorExpr, ident *dst.Ident) {
+	// `var x pkg.T` — Type is a bare SelectorExpr.
+	if p.Type == current {
+		p.Type = ident
+		return
+	}
+	replaceExprInSlice(p.Values, current, ident)
+}
+
+func replaceSelectorInBinary(p *dst.BinaryExpr, current *dst.SelectorExpr, ident *dst.Ident) {
+	// e.g. status == reporter.ConnectionStatusShutdown
+	if p.X == current {
+		p.X = ident
+	} else if p.Y == current {
+		p.Y = ident
 	}
 }
 
