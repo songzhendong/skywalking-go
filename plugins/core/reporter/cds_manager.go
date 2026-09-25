@@ -79,10 +79,19 @@ func (r *CDSManager) InitCDS(entity *Entity, cdsWatchers []AgentConfigChangeWatc
 				continue
 			}
 
-			configurations, err := r.cdsClient.FetchConfigurations(context.Background(), &configuration.ConfigurationSyncRequest{
+			ctx := context.Background()
+			cancel := func() {}
+			if r.connManager.IsMultiBackend() {
+				ctx, cancel = BackendRPCContext(r.serverAddr, r.cdsInterval)
+				if conn := r.connManager.PeekConnection(r.serverAddr); conn != nil {
+					r.cdsClient = configuration.NewConfigurationDiscoveryServiceClient(conn)
+				}
+			}
+			configurations, err := r.cdsClient.FetchConfigurations(ctx, &configuration.ConfigurationSyncRequest{
 				Service: r.entity.ServiceName,
 				Uuid:    r.cdsService.UUID,
 			})
+			cancel()
 
 			if err != nil {
 				r.logger.Errorf("fetch dynamic configuration error %v", err)

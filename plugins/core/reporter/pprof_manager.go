@@ -22,7 +22,10 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+	"sync/atomic"
 	"time"
+
+	"google.golang.org/grpc"
 
 	"github.com/apache/skywalking-go/plugins/core/operator"
 	commonv3 "github.com/apache/skywalking-go/protocols/collect/common/v3"
@@ -61,13 +64,51 @@ type PprofTaskManager struct {
 	logger         operator.LogOperator
 	serverAddr     string
 	pprofInterval  time.Duration
-	PprofClient    pprofv10.PprofTaskClient // for grpc
 	connManager    *ConnectionManager
 	entity         *Entity
 	pprofFilePath  string
 	LastUpdateTime int64
 	commands       PprofTaskCommand
 	pprofSendCh    chan *pprofv10.PprofData
+	// pprofClientBundle is swapped atomically so poll vs upload cannot race
+	// on the client interface field (Codex P2).
+	pprofClientBundle atomic.Pointer[pprofClientBundle]
+}
+
+type pprofClientBundle struct {
+	conn   *grpc.ClientConn
+	client pprofv10.PprofTaskClient
+}
+
+func (r *PprofTaskManager) storePprofClient(conn *grpc.ClientConn, client pprofv10.PprofTaskClient) {
+	if client == nil {
+		return
+	}
+	r.pprofClientBundle.Store(&pprofClientBundle{conn: conn, client: client})
+}
+
+func (r *PprofTaskManager) loadPprofClient() pprofv10.PprofTaskClient {
+	b := r.pprofClientBundle.Load()
+	if b == nil {
+		return nil
+	}
+	return b.client
+}
+
+// currentPprofClient returns a stub bound to the latest PeekConnection for
+// multi-backend, publishing a new bundle only when the ClientConn identity changes.
+func (r *PprofTaskManager) currentPprofClient() pprofv10.PprofTaskClient {
+	if r.connManager != nil && r.connManager.IsMultiBackend() {
+		if conn := r.connManager.PeekConnection(r.serverAddr); conn != nil {
+			if cur := r.pprofClientBundle.Load(); cur != nil && cur.conn == conn {
+				return cur.client
+			}
+			client := pprofv10.NewPprofTaskClient(conn)
+			r.storePprofClient(conn, client)
+			return client
+		}
+	}
+	return r.loadPprofClient()
 }
 
 func NewPprofTaskManager(logger operator.LogOperator, serverAddr string,
@@ -89,7 +130,7 @@ func NewPprofTaskManager(logger operator.LogOperator, serverAddr string,
 	if err != nil {
 		return nil, err
 	}
-	pprofManager.PprofClient = pprofv10.NewPprofTaskClient(conn)
+	pprofManager.storePprofClient(conn, pprofv10.NewPprofTaskClient(conn))
 	pprofManager.commands = nil
 	return pprofManager, nil
 }
@@ -106,11 +147,23 @@ func (r *PprofTaskManager) InitPprofTask(entity *Entity) {
 				time.Sleep(r.pprofInterval)
 				continue
 			}
-			pprofCommand, err := r.PprofClient.GetPprofTaskCommands(context.Background(), &pprofv10.PprofTaskCommandQuery{
+			ctx := context.Background()
+			cancel := func() {}
+			if r.connManager.IsMultiBackend() {
+				ctx, cancel = BackendRPCContext(r.serverAddr, r.pprofInterval)
+			}
+			client := r.currentPprofClient()
+			if client == nil {
+				cancel()
+				time.Sleep(r.pprofInterval)
+				continue
+			}
+			pprofCommand, err := client.GetPprofTaskCommands(ctx, &pprofv10.PprofTaskCommandQuery{
 				Service:         r.entity.ServiceName,
 				ServiceInstance: r.entity.ServiceInstanceName,
 				LastCommandTime: r.LastUpdateTime,
 			})
+			cancel()
 			if err != nil {
 				r.logger.Errorf("fetch pprof task commands error %v", err)
 				time.Sleep(r.pprofInterval)
@@ -291,13 +344,32 @@ func (r *PprofTaskManager) initPprofSendPipeline() {
 }
 
 func (r *PprofTaskManager) uploadPprofData(pprofData *pprofv10.PprofData) {
+	err := r.uploadPprofDataOnce(pprofData)
+	if err == nil {
+		return
+	}
+	r.logger.Errorf("failed to upload pprof: %v", err)
+	if r.connManager == nil || !r.connManager.IsMultiBackend() {
+		return
+	}
+	// Refresh stub from the current ClientConn and retry once after recreate/failover.
+	_ = r.currentPprofClient()
+	if err := r.uploadPprofDataOnce(pprofData); err != nil {
+		r.logger.Errorf("retry upload pprof failed: %v", err)
+	}
+}
+
+func (r *PprofTaskManager) uploadPprofDataOnce(pprofData *pprofv10.PprofData) error {
+	client := r.currentPprofClient()
+	if client == nil {
+		return fmt.Errorf("pprof client unavailable")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	stream, err := r.PprofClient.Collect(ctx)
+	stream, err := client.Collect(ctx)
 	if err != nil {
-		r.logger.Errorf("failed to start collect stream: %v", err)
-		return
+		return fmt.Errorf("start collect stream: %w", err)
 	}
 
 	// Send metadata first
@@ -305,25 +377,21 @@ func (r *PprofTaskManager) uploadPprofData(pprofData *pprofv10.PprofData) {
 		Metadata: pprofData.Metadata,
 	}
 	if err = stream.Send(metadataMsg); err != nil {
-		r.logger.Errorf("failed to send metadata: %v", err)
-		return
+		return fmt.Errorf("send metadata: %w", err)
 	}
 
 	resp, err := stream.Recv()
 	if err != nil {
-		r.logger.Errorf("failed to receive server response: %v", err)
-		return
+		return fmt.Errorf("receive server response: %w", err)
 	}
 
 	switch resp.Status {
 	case pprofv10.PprofProfilingStatus_PPROF_TERMINATED_BY_OVERSIZE:
-		r.logger.Errorf("pprof is too large to be received by the oap server")
 		r.closePprofStream(stream)
-		return
+		return fmt.Errorf("pprof is too large to be received by the oap server")
 	case pprofv10.PprofProfilingStatus_PPROF_EXECUTION_TASK_ERROR:
-		r.logger.Errorf("server rejected pprof upload due to execution task error")
 		r.closePprofStream(stream)
-		return
+		return fmt.Errorf("server rejected pprof upload due to execution task error")
 	}
 
 	// Upload content in chunks
@@ -344,20 +412,19 @@ func (r *PprofTaskManager) uploadPprofData(pprofData *pprofv10.PprofData) {
 		}
 
 		if err := stream.Send(chunkData); err != nil {
-			r.logger.Errorf("failed to send pprof chunk %d: %v", chunkCount, err)
-			return
+			return fmt.Errorf("send pprof chunk %d: %w", chunkCount, err)
 		}
 		chunkCount++
 		// Check context timeout
 		select {
 		case <-ctx.Done():
-			r.logger.Errorf("context timeout during chunk upload for task %s", pprofData.Metadata.TaskId)
-			return
+			return fmt.Errorf("context timeout during chunk upload for task %s", pprofData.Metadata.TaskId)
 		default:
 		}
 	}
 
 	r.closePprofStream(stream)
+	return nil
 }
 func (r *PprofTaskManager) closePprofStream(stream pprofv10.PprofTask_CollectClient) {
 	if err := stream.CloseSend(); err != nil {
