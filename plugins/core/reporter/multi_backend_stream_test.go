@@ -438,3 +438,37 @@ func TestRacePprofClientSwap(t *testing.T) {
 	close(stop)
 	wg.Wait()
 }
+
+func TestMultiBackendSendRecoversPanic(t *testing.T) {
+	err := MultiBackendSend(nil, func() error {
+		panic("boom")
+	}, time.Second)
+	if !IsMultiBackendSendPanic(err) {
+		t.Fatalf("want panic error, got %v", err)
+	}
+}
+
+func TestRecreateConnectionDoesNotResurrectAfterClose(t *testing.T) {
+	aLis, aGS := serveTrace(t, &countingTraceServer{})
+	defer aLis.Close()
+	defer aGS.Stop()
+	bLis, bGS := serveTrace(t, &countingTraceServer{})
+	defer bLis.Close()
+	defer bGS.Stop()
+
+	backends := aLis.Addr().String() + "," + bLis.Addr().String()
+	cm, err := NewConnectionManager(nil, 50*time.Millisecond, backends, "", nil)
+	if err != nil {
+		t.Fatalf("NewConnectionManager: %v", err)
+	}
+	if _, getErr := cm.GetConnection(backends); getErr != nil {
+		t.Fatalf("GetConnection: %v", getErr)
+	}
+	cm.Close()
+	if recreateErr := cm.RecreateConnection(backends); recreateErr == nil {
+		t.Fatal("expected recreate to fail after Close removed the entry")
+	}
+	if cm.PeekConnection(backends) != nil {
+		t.Fatal("recreate must not resurrect a closed connection manager entry")
+	}
+}

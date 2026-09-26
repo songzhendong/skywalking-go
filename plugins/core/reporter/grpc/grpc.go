@@ -231,6 +231,11 @@ func (r *gRPCReporter) sendWithRecover(send func() error) (recovered bool, err e
 		}
 	}()
 	err = send()
+	// MultiBackendSend recovers panics in its helper goroutine; treat like local recover.
+	if reporter.IsMultiBackendSendPanic(err) {
+		r.logger.Errorf("gRPCReporter recovered from panic while sending, skip current message: %v", err)
+		return true, nil
+	}
 	return recovered, err
 }
 
@@ -319,10 +324,10 @@ func (r *gRPCReporter) multiBackendTraceSendLoop() {
 		}
 		if err := r.sendTraceSegmentMulti(s); err != nil {
 			r.logger.Errorf("send segment error %v", err)
+			// Reconnect for subsequent segments; do not replay s — if the first
+			// Collect already accepted the write, a retry would duplicate it in OAP
+			// (same rationale as service-config: no Collect replay).
 			r.reconnectMultiBackend()
-			if err2 := r.sendTraceSegmentMulti(s); err2 != nil {
-				r.logger.Errorf("retry send segment error %v", err2)
-			}
 		}
 	}
 	r.closeGRPCConn()

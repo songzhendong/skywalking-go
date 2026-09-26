@@ -21,6 +21,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -107,6 +108,9 @@ type ManagedConnection struct {
 	connection *grpc.ClientConn
 	status     ConnectionStatus
 	refCount   int
+	// recreating is set while RecreateConnection dials so GetConnection waits
+	// instead of returning a ClientConn that is about to be closed.
+	recreating bool
 }
 
 func (cm *ConnectionManager) GetMD() metadata.MD {
@@ -123,14 +127,23 @@ func (cm *ConnectionManager) GetConnection(serverAddr string) (*grpc.ClientConn,
 	// Same mutex as RecreateConnection / ReleaseConnection / PeekConnection:
 	// unlocked map+refCount access raced with multi-backend recreate at runtime
 	// and with concurrent GetConnection from reporter/CDS/pprof at boot.
-	cm.mu.Lock()
-	if managed, exists := cm.connManager[serverAddr]; exists {
+	for {
+		cm.mu.Lock()
+		managed, exists := cm.connManager[serverAddr]
+		if !exists {
+			cm.mu.Unlock()
+			break
+		}
+		if managed.recreating {
+			cm.mu.Unlock()
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
 		managed.refCount++
 		conn := managed.connection
 		cm.mu.Unlock()
 		return conn, nil
 	}
-	cm.mu.Unlock()
 
 	conn, err := cm.createConnection()
 	if err != nil {
@@ -139,6 +152,11 @@ func (cm *ConnectionManager) GetConnection(serverAddr string) (*grpc.ClientConn,
 
 	cm.mu.Lock()
 	if managed, exists := cm.connManager[serverAddr]; exists {
+		if managed.recreating {
+			cm.mu.Unlock()
+			_ = conn.Close()
+			return cm.GetConnection(serverAddr)
+		}
 		managed.refCount++
 		existing := managed.connection
 		cm.mu.Unlock()
@@ -309,6 +327,16 @@ var multiBackendSendCancelGrace = 2 * time.Second
 
 var errMultiBackendSendTimeout = fmt.Errorf("multi-backend send timed out")
 
+// errMultiBackendSendPanic is returned when the send goroutine panics so callers
+// can treat it like sendWithRecover (skip message) instead of crashing the process.
+var errMultiBackendSendPanic = fmt.Errorf("multi-backend send panic")
+
+// IsMultiBackendSendPanic reports whether err was produced by recovering a panic
+// inside MultiBackendSend's helper goroutine.
+func IsMultiBackendSendPanic(err error) bool {
+	return err != nil && errors.Is(err, errMultiBackendSendPanic)
+}
+
 // MultiBackendSendTimeoutForTest / SetMultiBackendSendTimeoutForTest let unit
 // tests exercise kill→standby without waiting the production 8s bound.
 func MultiBackendSendTimeoutForTest() time.Duration { return multiBackendSendTimeout }
@@ -328,13 +356,23 @@ func SetMultiBackendSendCancelGraceForTest(d time.Duration) {
 // done is buffered so that if we return after grace while send is still
 // blocked, the send goroutine can later exit without a second drain goroutine
 // (Codex P2). RecreateConnection closes the old ClientConn to unblock it.
+//
+// Panics from send are recovered in the helper goroutine: caller's
+// sendWithRecover cannot see them across goroutine boundaries.
 func MultiBackendSend(cancel context.CancelFunc, send func() error, timeout time.Duration) error {
 	if timeout <= 0 {
 		timeout = multiBackendSendTimeout
 	}
 	done := make(chan error, 1)
 	go func() {
-		done <- send()
+		var err error
+		defer func() {
+			if rec := recover(); rec != nil {
+				err = fmt.Errorf("%w: %v", errMultiBackendSendPanic, rec)
+			}
+			done <- err
+		}()
+		err = send()
 	}()
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
@@ -533,33 +571,52 @@ func (cm *ConnectionManager) ReleaseConnection(serverAddr string) error {
 // try the standby on a fresh channel. Swaps the connection in place so
 // GetConnectionStatus never returns Shutdown mid-recreate (that would make
 // send loops exit forever and drop post-failover probe spans).
+//
+// Dial runs outside the map mutex, but the entry is marked recreating so
+// GetConnection waits instead of returning a ClientConn that is about to be
+// closed. If Release/Close removes the entry during dial, the new connection
+// is discarded (no resurrect).
 func (cm *ConnectionManager) RecreateConnection(serverAddr string) error {
 	if !cm.multiBackend {
 		return fmt.Errorf("RecreateConnection is multi-backend only")
 	}
-	conn, err := cm.createConnection()
-	if err != nil {
-		return err
-	}
+
 	cm.mu.Lock()
 	old, exists := cm.connManager[serverAddr]
 	if !exists {
-		cm.connManager[serverAddr] = &ManagedConnection{
-			connection: conn,
-			status:     ConnectionStatusConnected,
-			refCount:   1,
-		}
 		cm.mu.Unlock()
-		go cm.checkConnectionStatus(serverAddr)
-		if cm.logger != nil {
-			cm.logger.Infof("recreated multi-backend gRPC connection after send/open failure")
-		}
+		return fmt.Errorf("no managed connection to recreate")
+	}
+	if old.recreating {
+		cm.mu.Unlock()
 		return nil
 	}
-	prev := old.connection
-	old.connection = conn
-	old.status = ConnectionStatusConnected
+	old.recreating = true
 	cm.mu.Unlock()
+
+	conn, err := cm.createConnection()
+	if err != nil {
+		cm.mu.Lock()
+		if managed, ok := cm.connManager[serverAddr]; ok {
+			managed.recreating = false
+		}
+		cm.mu.Unlock()
+		return err
+	}
+
+	cm.mu.Lock()
+	managed, exists := cm.connManager[serverAddr]
+	if !exists {
+		cm.mu.Unlock()
+		_ = conn.Close()
+		return fmt.Errorf("connection released during recreate")
+	}
+	prev := managed.connection
+	managed.connection = conn
+	managed.status = ConnectionStatusConnected
+	managed.recreating = false
+	cm.mu.Unlock()
+
 	if prev != nil && prev != conn {
 		_ = prev.Close()
 	}
