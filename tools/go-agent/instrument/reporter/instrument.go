@@ -161,6 +161,9 @@ func (i *Instrument) generateReporterInitFile(dir, reporterType string) (string,
 	if reporterType == consts.KafkaReporter {
 		reporterInitTemplate += `
 	_, cdsManager, _, err := initManager(logger, checkInterval)
+	if err == errNoValidBackendService {
+		return NewDiscardReporter(), nil
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -170,6 +173,9 @@ func (i *Instrument) generateReporterInitFile(dir, reporterType string) (string,
 	} else {
 		reporterInitTemplate += `
 	connManager, cdsManager, pprofTaskManager, err := initManager(logger, checkInterval)
+	if err == errNoValidBackendService {
+		return NewDiscardReporter(), nil
+	}
 	if err != nil {
 		return nil, err
 	}

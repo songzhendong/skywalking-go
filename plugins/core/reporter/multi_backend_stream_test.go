@@ -1,0 +1,314 @@
+// Licensed to Apache Software Foundation (ASF) under one or more contributor
+// license agreements. See the NOTICE file distributed with
+// this work for additional information regarding copyright
+// ownership. Apache Software Foundation (ASF) licenses this file to you under
+// the Apache License, Version 2.0 (the "License"); you may
+// not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package reporter
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
+	"google.golang.org/grpc/metadata"
+
+	v3 "github.com/apache/skywalking-go/protocols/collect/common/v3"
+	agentv3 "github.com/apache/skywalking-go/protocols/collect/language/agent/v3"
+)
+
+type countingTraceServer struct {
+	agentv3.UnimplementedTraceSegmentReportServiceServer
+	count atomic.Int64
+}
+
+func (s *countingTraceServer) Collect(stream agentv3.TraceSegmentReportService_CollectServer) error {
+	for {
+		_, err := stream.Recv()
+		if err != nil {
+			if err == io.EOF {
+				return stream.SendAndClose(&v3.Commands{})
+			}
+			return err
+		}
+		s.count.Add(1)
+	}
+}
+
+func TestMultiBackendCollectSendFailsOverAfterActiveStops(t *testing.T) {
+	aSrv := &countingTraceServer{}
+	bSrv := &countingTraceServer{}
+
+	aLis, aGS := serveTrace(t, aSrv)
+	defer aLis.Close()
+	defer aGS.Stop()
+	aAddr := aLis.Addr().String()
+	bLis, bGS := serveTrace(t, bSrv)
+	defer bLis.Close()
+	defer bGS.Stop()
+	bAddr := bLis.Addr().String()
+
+	backends := aAddr + "," + bAddr
+	cm, err := NewConnectionManager(nil, time.Second, backends, "", nil)
+	if err != nil {
+		t.Fatalf("NewConnectionManager: %v", err)
+	}
+	defer cm.Close()
+
+	conn, err := cm.GetConnection(backends)
+	if err != nil {
+		t.Fatalf("GetConnection: %v", err)
+	}
+	client := agentv3.NewTraceSegmentReportServiceClient(conn)
+
+	ctx, cancel, stopOpen := BackendStreamContext(backends, time.Second)
+	stream, err := client.Collect(metadata.NewOutgoingContext(ctx, cm.GetMD()))
+	if timedOut := stopOpen(); err != nil || timedOut {
+		cancel()
+		t.Fatalf("open Collect: err=%v timedOut=%v", err, timedOut)
+	}
+	go WatchConnCancelOnUnready(ctx, cancel, conn)
+
+	seg := &agentv3.SegmentObject{TraceId: "t1", TraceSegmentId: "s1"}
+	if sendErr := MultiBackendSend(cancel, func() error { return stream.Send(seg) }, time.Second); sendErr != nil {
+		t.Fatalf("initial Send: %v", sendErr)
+	}
+	waitFor(t, func() bool { return aSrv.count.Load()+bSrv.count.Load() >= 1 }, 5*time.Second)
+
+	// Stop active like docker kill: close listener hard so the peer half-opens.
+	standby := bSrv
+	if aSrv.count.Load() > 0 {
+		aGS.Stop()
+		_ = aLis.Close()
+	} else {
+		bGS.Stop()
+		_ = bLis.Close()
+		standby = aSrv
+	}
+
+	// Bound Send: either errors quickly or is canceled by MultiBackendSend.
+	_ = MultiBackendSend(cancel, func() error {
+		return stream.Send(&agentv3.SegmentObject{TraceId: "t2", TraceSegmentId: "s2"})
+	}, 2*time.Second)
+	cancel()
+
+	// Native pick_first recovers on the same channel and generated stub.
+	before := standby.count.Load()
+	deadline := time.Now().Add(15 * time.Second)
+	for attempt := 0; time.Now().Before(deadline); attempt++ {
+		// The first RPC after Stop can race transport failure detection. Drop
+		// that failed report and probe with a new ID, just as the reporter does.
+		probeID := "post-stop-" + strconv.Itoa(attempt)
+		if sendTraceProbe(client, cm.GetMD(), probeID) == nil && standby.count.Load() > before {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("new reports did not reach the standby on the existing channel")
+}
+
+func sendTraceProbe(client agentv3.TraceSegmentReportServiceClient, md metadata.MD, id string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	stream, err := client.Collect(metadata.NewOutgoingContext(ctx, md), grpc.WaitForReady(true))
+	if err != nil {
+		return err
+	}
+	if sendErr := stream.Send(&agentv3.SegmentObject{TraceId: id, TraceSegmentId: id}); sendErr != nil {
+		return sendErr
+	}
+	_, err = stream.CloseAndRecv()
+	return err
+}
+
+func serveTrace(t *testing.T, srv agentv3.TraceSegmentReportServiceServer) (net.Listener, *grpc.Server) {
+	t.Helper()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	gs := grpc.NewServer()
+	agentv3.RegisterTraceSegmentReportServiceServer(gs, srv)
+	go func() { _ = gs.Serve(lis) }()
+	return lis, gs
+}
+
+func TestMultiBackendSendCancelsOnTimeout(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	err := MultiBackendSend(cancel, func() error {
+		<-ctx.Done()
+		return ctx.Err()
+	}, 50*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected timeout cancel error")
+	}
+}
+
+func TestMultiBackendSendReturnsWhenSendIgnoresCancel(t *testing.T) {
+	// Half-open peers may not unblock Send/CloseAndRecv after ctx cancel.
+	// MultiBackendSend must still return so the reporter can recreate + standby.
+	start := time.Now()
+	err := MultiBackendSend(func() {}, func() error {
+		time.Sleep(30 * time.Second)
+		return nil
+	}, 50*time.Millisecond)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected timeout error when send ignores cancel")
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("MultiBackendSend blocked too long after cancel: %v", elapsed)
+	}
+}
+
+func TestMultiBackendStatusReflectsConnClose(t *testing.T) {
+	aLis, aGS := serveTrace(t, &countingTraceServer{})
+	defer aLis.Close()
+	defer aGS.Stop()
+	bLis, bGS := serveTrace(t, &countingTraceServer{})
+	defer bLis.Close()
+	defer bGS.Stop()
+
+	backends := aLis.Addr().String() + "," + bLis.Addr().String()
+	cm, err := NewConnectionManager(nil, 50*time.Millisecond, backends, "", nil)
+	if err != nil {
+		t.Fatalf("NewConnectionManager: %v", err)
+	}
+	defer cm.Close()
+	conn, err := cm.GetConnection(backends)
+	if err != nil {
+		t.Fatalf("GetConnection: %v", err)
+	}
+	_ = conn.Close()
+	if got := cm.GetConnectionStatus(backends); got != ConnectionStatusShutdown {
+		t.Fatalf("status=%v want Shutdown", got)
+	}
+}
+
+func TestMultiBackendSendPanicReachesCaller(t *testing.T) {
+	for _, afterCancel := range []bool{false, true} {
+		name := "immediate"
+		if afterCancel {
+			name = "after timeout cancellation"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var recovered interface{}
+			func() {
+				defer func() { recovered = recover() }()
+				_ = MultiBackendSend(cancel, func() error {
+					if afterCancel {
+						<-ctx.Done()
+					}
+					panic("protobuf marshal panic")
+				}, 20*time.Millisecond)
+			}()
+			if recovered != "protobuf marshal panic" {
+				t.Fatalf("caller recovered %v, want original panic", recovered)
+			}
+			if err := MultiBackendSend(cancel, func() error { return nil }, time.Second); err != nil {
+				t.Fatalf("next send failed: %v", err)
+			}
+		})
+	}
+}
+
+// Concurrent acquisition and release must preserve shared connection ownership.
+func TestConcurrentGetRelease(t *testing.T) {
+	aLis, aGS := serveTrace(t, &countingTraceServer{})
+	defer aLis.Close()
+	defer aGS.Stop()
+	bLis, bGS := serveTrace(t, &countingTraceServer{})
+	defer bLis.Close()
+	defer bGS.Stop()
+
+	backends := aLis.Addr().String() + "," + bLis.Addr().String()
+	cm, err := NewConnectionManager(nil, 50*time.Millisecond, backends, "", nil)
+	if err != nil {
+		t.Fatalf("NewConnectionManager: %v", err)
+	}
+	defer cm.Close()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 20; j++ {
+				conn, getErr := cm.GetConnection(backends)
+				if getErr != nil {
+					t.Errorf("GetConnection: %v", getErr)
+					return
+				}
+				if conn.GetState() == connectivity.Shutdown {
+					t.Error("acquired connection closed while its reference is held")
+				}
+				_ = cm.ReleaseConnection(backends)
+				_ = cm.PeekConnection(backends)
+				_ = cm.GetConnectionStatus(backends)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func TestMultiBackendServiceConfigRetryOnlyProperties(t *testing.T) {
+	var cfg struct {
+		MethodConfig []struct {
+			Name []struct {
+				Service string `json:"service"`
+				Method  string `json:"method"`
+			} `json:"name"`
+			RetryPolicy *struct {
+				RetryableStatusCodes []string `json:"retryableStatusCodes"`
+			} `json:"retryPolicy"`
+		} `json:"methodConfig"`
+	}
+	if err := json.Unmarshal([]byte(multiBackendServiceConfig), &cfg); err != nil {
+		t.Fatalf("service config JSON: %v", err)
+	}
+	var withRetry int
+	for _, mc := range cfg.MethodConfig {
+		if mc.RetryPolicy == nil {
+			continue
+		}
+		withRetry++
+		if len(mc.Name) != 1 ||
+			mc.Name[0].Service != "skywalking.v3.ManagementService" ||
+			mc.Name[0].Method != "reportInstanceProperties" {
+			t.Fatalf("retryPolicy must only target reportInstanceProperties, got %+v", mc.Name)
+		}
+		if len(mc.RetryPolicy.RetryableStatusCodes) != 1 ||
+			mc.RetryPolicy.RetryableStatusCodes[0] != "UNAVAILABLE" {
+			t.Fatalf("unexpected retryableStatusCodes: %+v", mc.RetryPolicy.RetryableStatusCodes)
+		}
+	}
+	if withRetry != 1 {
+		t.Fatalf("want exactly 1 methodConfig with retryPolicy, got %d", withRetry)
+	}
+}
+
+// TestRaceConnManagerGetRelease is picked up by `make test-race` (-run '^TestRace').
+func TestRaceConnManagerGetRelease(t *testing.T) {
+	TestConcurrentGetRelease(t)
+}
