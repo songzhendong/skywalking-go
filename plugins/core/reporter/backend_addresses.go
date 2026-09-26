@@ -23,15 +23,17 @@ import (
 	"strings"
 
 	"google.golang.org/grpc/resolver"
+
+	"github.com/apache/skywalking-go/plugins/core/operator"
 )
 
+var errNoValidBackendService = fmt.Errorf("no valid backend service addresses")
+
 // parseBackendServiceList splits a comma-separated backend_service config into
-// normalized host:port entries. Empty segments are skipped; duplicates removed.
-func parseBackendServiceList(raw string) ([]string, error) {
+// normalized host:port entries. Invalid entries are warned about and skipped;
+// empty segments and duplicates are removed.
+func parseBackendServiceList(raw string, logger operator.LogOperator) ([]string, error) {
 	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return nil, fmt.Errorf("backend service address is empty")
-	}
 	parts := strings.Split(raw, ",")
 	out := make([]string, 0, len(parts))
 	seen := make(map[string]struct{}, len(parts))
@@ -42,7 +44,10 @@ func parseBackendServiceList(raw string) ([]string, error) {
 		}
 		host, port, err := splitBackendServiceAddress(part)
 		if err != nil {
-			return nil, err
+			if logger != nil {
+				logger.Warnf("skipping invalid backend service address %q: %v", part, err)
+			}
+			continue
 		}
 		normalized := net.JoinHostPort(host, port)
 		if _, ok := seen[normalized]; ok {
@@ -52,17 +57,9 @@ func parseBackendServiceList(raw string) ([]string, error) {
 		out = append(out, normalized)
 	}
 	if len(out) == 0 {
-		return nil, fmt.Errorf("backend service address is empty")
+		return nil, errNoValidBackendService
 	}
 	return out, nil
-}
-
-// isMultiBackendService is true only when backend_service normalizes to two or
-// more distinct host:port entries. Trailing commas / duplicates that collapse
-// to one address are not multi-backend.
-func isMultiBackendService(serverAddr string) bool {
-	backends, err := parseBackendServiceList(serverAddr)
-	return err == nil && len(backends) >= 2
 }
 
 func splitBackendServiceAddress(serverAddr string) (host, port string, err error) {
@@ -100,7 +97,7 @@ func isIPLiteralHost(host string) bool {
 	return net.ParseIP(host) != nil
 }
 
-// firstBackendAuthority keeps the first configured endpoint, including its port,
+// firstBackendAuthority keeps the first valid configured endpoint, including its port,
 // as the channel authority regardless of the shuffled dial order.
 func firstBackendAuthority(backends []string) string {
 	if len(backends) == 0 {

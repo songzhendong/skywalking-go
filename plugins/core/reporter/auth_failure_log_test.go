@@ -18,6 +18,7 @@ package reporter
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -30,14 +31,19 @@ import (
 )
 
 type captureAuthLogger struct {
-	errors []string
+	errors   []string
+	warnings []string
 }
 
 func (c *captureAuthLogger) WithField(key string, value interface{}) interface{} { return c }
 func (c *captureAuthLogger) Info(args ...interface{})                            {}
 func (c *captureAuthLogger) Infof(format string, args ...interface{})            {}
-func (c *captureAuthLogger) Warn(args ...interface{})                            {}
-func (c *captureAuthLogger) Warnf(format string, args ...interface{})            {}
+func (c *captureAuthLogger) Warn(args ...interface{}) {
+	c.warnings = append(c.warnings, fmt.Sprint(args...))
+}
+func (c *captureAuthLogger) Warnf(format string, args ...interface{}) {
+	c.warnings = append(c.warnings, fmt.Sprintf(format, args...))
+}
 func (c *captureAuthLogger) Error(args ...interface{}) {
 	c.errors = append(c.errors, "Error")
 }
@@ -169,9 +175,6 @@ func TestIsMultiBackendServiceNormalize(t *testing.T) {
 		{"a.example.com:11800, b.example.com:11800", true},
 	}
 	for _, tc := range cases {
-		if got := isMultiBackendService(tc.raw); got != tc.want {
-			t.Fatalf("%q: got %v want %v", tc.raw, got, tc.want)
-		}
 		cm, err := NewConnectionManager(nil, time.Second, tc.raw, "", nil)
 		if err != nil {
 			t.Fatalf("cm %q: %v", tc.raw, err)
@@ -214,7 +217,7 @@ func TestBackendRPCContextMultiHasDeadline(t *testing.T) {
 
 func TestConnectionManagerResolvedBackendAddresses(t *testing.T) {
 	var published []string
-	builder, err := newStaticBackendResolverBuilder(nil, "10.0.0.1:11800,10.0.0.2:11800",
+	builder, err := newStaticBackendResolverBuilder(nil, []string{"10.0.0.1:11800", "10.0.0.2:11800"},
 		func(addrs []string) { published = append([]string(nil), addrs...) })
 	if err != nil {
 		t.Fatalf("builder: %v", err)

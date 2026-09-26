@@ -21,6 +21,7 @@ import (
 	"net"
 	"reflect"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -124,7 +125,7 @@ func TestBackendAuthorityFollowsFirstConfiguredEndpoint(t *testing.T) {
 func TestStaticMultiBackendKeepsOrderAcrossResolveNow(t *testing.T) {
 	var published []string
 	raw := testMultiBackendCSV + "," + testIPLiteralAddr
-	builder, err := newStaticBackendResolverBuilder(nil, raw, func(addrs []string) { published = addrs })
+	builder, err := newStaticBackendResolverBuilder(nil, strings.Split(raw, ","), func(addrs []string) { published = addrs })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,20 +159,20 @@ func TestStaticMultiBackendKeepsOrderAcrossResolveNow(t *testing.T) {
 }
 
 func TestParseBackendServiceList(t *testing.T) {
-	got, err := parseBackendServiceList(" " + testBackendAddrA + " , " + testIPLiteralAddr + ", " + testBackendAddrA + " ")
+	got, err := parseBackendServiceList(" "+testBackendAddrA+" , "+testIPLiteralAddr+", "+testBackendAddrA+" ", nil)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
 	if len(got) != 2 || got[0] != testBackendAddrA || got[1] != testIPLiteralAddr {
 		t.Fatalf("got %#v", got)
 	}
-	if _, emptyErr := parseBackendServiceList(""); emptyErr == nil {
+	if _, emptyErr := parseBackendServiceList("", nil); emptyErr != errNoValidBackendService {
 		t.Fatal("expected empty error")
 	}
-	if _, badErr := parseBackendServiceList("bad"); badErr == nil {
+	if _, badErr := parseBackendServiceList("bad", nil); badErr != errNoValidBackendService {
 		t.Fatal("expected invalid address error")
 	}
-	v6, err := parseBackendServiceList("[2001:db8::1]:11800")
+	v6, err := parseBackendServiceList("[2001:db8::1]:11800", nil)
 	if err != nil {
 		t.Fatalf("ipv6: %v", err)
 	}
@@ -191,11 +192,16 @@ func TestIsIPLiteralHost(t *testing.T) {
 
 func TestBackendServicePortValidation(t *testing.T) {
 	for _, port := range []string{"0", "65536", "grpc", "1.5", "+11800", "-1"} {
-		if _, err := parseBackendServiceList("oap:" + port + "," + testBackendAddr); err == nil {
-			t.Errorf("accepted invalid port %q", port)
+		logger := &captureAuthLogger{}
+		got, err := parseBackendServiceList("oap:"+port+","+testBackendAddr, logger)
+		if err != nil || !reflect.DeepEqual(got, []string{testBackendAddr}) {
+			t.Errorf("invalid port %q was not skipped: %v, %v", port, got, err)
+		}
+		if len(logger.warnings) != 1 || !strings.Contains(logger.warnings[0], "oap:"+port) || len(logger.errors) != 0 {
+			t.Errorf("invalid port %q: warnings=%v errors=%v", port, logger.warnings, logger.errors)
 		}
 	}
-	got, err := parseBackendServiceList("oap:011800,oap:11800")
+	got, err := parseBackendServiceList("oap:011800,oap:11800", nil)
 	if err != nil || len(got) != 1 || got[0] != "oap:11800" {
 		t.Fatalf("port normalization: %v, %v", got, err)
 	}
@@ -232,13 +238,14 @@ func TestMultiBackendChannelAuthority(t *testing.T) {
 	b, bServer := serveTrace(t, &countingTraceServer{})
 	defer b.Close()
 	defer bServer.Stop()
-	backends := a.Addr().String() + "," + b.Addr().String()
+	backends := "invalid," + a.Addr().String() + "," + b.Addr().String()
 	for _, override := range []string{"", "common.example.com"} {
 		t.Run("override="+override, func(t *testing.T) {
 			creds := &recordingAuthorityCredentials{
 				TransportCredentials: insecure.NewCredentials(), serverName: override, authorities: make(chan string, 10),
 			}
-			cm, err := NewConnectionManager(nil, time.Second, backends, "", creds)
+			logger := &captureAuthLogger{}
+			cm, err := NewConnectionManager(logger, time.Second, backends, "", creds)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -258,12 +265,21 @@ func TestMultiBackendChannelAuthority(t *testing.T) {
 			case <-time.After(5 * time.Second):
 				t.Fatal("transport handshake did not start")
 			}
+			if !cm.IsMultiBackend() {
+				t.Fatal("two valid endpoints must use the multi-backend policy")
+			}
+			if _, err := cm.GetConnection(backends); err != nil {
+				t.Fatal(err)
+			}
+			if len(logger.warnings) != 1 || !strings.Contains(logger.warnings[0], "invalid") || len(logger.errors) != 0 {
+				t.Fatalf("warnings=%v errors=%v", logger.warnings, logger.errors)
+			}
 		})
 	}
 }
 
 func TestStaticMultiBackendPublishesLiterals(t *testing.T) {
-	builder, err := newStaticBackendResolverBuilder(nil, testMultiBackendCSV, nil)
+	builder, err := newStaticBackendResolverBuilder(nil, []string{testBackendAddrA, testBackendAddrB}, nil)
 	if err != nil {
 		t.Fatalf("builder: %v", err)
 	}
@@ -280,7 +296,7 @@ func TestStaticMultiBackendPublishesLiterals(t *testing.T) {
 }
 
 func TestStaticMultiBackendDoesNotExpandDNS(t *testing.T) {
-	builder, err := newStaticBackendResolverBuilder(nil, testIPLiteralAddr+",10.0.0.2:11800", nil)
+	builder, err := newStaticBackendResolverBuilder(nil, []string{testIPLiteralAddr, "10.0.0.2:11800"}, nil)
 	if err != nil {
 		t.Fatalf("builder: %v", err)
 	}
@@ -313,7 +329,7 @@ func TestMultiBackendPickFirstFailsOver(t *testing.T) {
 	badAddr := badLis.Addr().String()
 	_ = badLis.Close()
 
-	backends := badAddr + "," + goodAddr
+	backends := []string{badAddr, goodAddr}
 	builder, err := newStaticBackendResolverBuilder(nil, backends, nil)
 	if err != nil {
 		t.Fatalf("builder: %v", err)
@@ -421,24 +437,62 @@ func TestConnectionManagerNormalizedSingleBackendDial(t *testing.T) {
 	go func() { _ = gs.Serve(lis) }()
 	defer gs.Stop()
 
-	cases := []string{
-		addr + "," + addr, // duplicate collapses to one
-		addr + ",",        // trailing comma
+	cases := []struct {
+		raw      string
+		warnings int
+	}{
+		{addr + "," + addr, 0}, // duplicate collapses to one
+		{addr + ",", 0},        // trailing comma
+		{"invalid," + addr, 1}, // invalid endpoint is skipped
 	}
-	for _, raw := range cases {
-		t.Run(raw, func(t *testing.T) {
-			cm, err := NewConnectionManager(nil, time.Second, raw, "", nil)
+	for _, tc := range cases {
+		t.Run(tc.raw, func(t *testing.T) {
+			logger := &captureAuthLogger{}
+			cm, err := NewConnectionManager(logger, time.Second, tc.raw, "", nil)
 			if err != nil {
 				t.Fatalf("NewConnectionManager: %v", err)
 			}
 			defer cm.Close()
-			conn, err := cm.GetConnection(raw)
+			conn, err := cm.GetConnection(tc.raw)
 			if err != nil {
 				t.Fatalf("GetConnection: %v", err)
 			}
 			waitFor(t, func() bool {
 				return conn.GetState() == connectivity.Ready
 			}, 8*time.Second)
+			if cm.IsMultiBackend() || conn.Target() != addr {
+				t.Fatalf("single surviving endpoint uses wrong policy: multi=%v target=%q", cm.IsMultiBackend(), conn.Target())
+			}
+			if _, err := cm.GetConnection(tc.raw); err != nil {
+				t.Fatal(err)
+			}
+			if len(logger.warnings) != tc.warnings || len(logger.errors) != 0 {
+				t.Fatalf("warnings=%v errors=%v", logger.warnings, logger.errors)
+			}
+		})
+	}
+}
+
+func TestConnectionManagerNoValidBackends(t *testing.T) {
+	for _, tc := range []struct {
+		raw      string
+		warnings int
+	}{
+		{"bad,oap:0,[::1]:65536", 4},
+		{" , , ", 1},
+	} {
+		t.Run(tc.raw, func(t *testing.T) {
+			logger := &captureAuthLogger{}
+			cm, err := NewConnectionManager(logger, time.Second, tc.raw, "", nil)
+			if cm != nil || err != errNoValidBackendService {
+				t.Fatalf("no valid endpoints must disable reporting: manager=%v err=%v", cm, err)
+			}
+			if len(logger.warnings) != tc.warnings || len(logger.errors) != 0 {
+				t.Fatalf("warnings=%v errors=%v", logger.warnings, logger.errors)
+			}
+			if !strings.Contains(logger.warnings[len(logger.warnings)-1], "reporter is disabled") {
+				t.Fatalf("missing disabled warning: %v", logger.warnings)
+			}
 		})
 	}
 }

@@ -12,9 +12,12 @@ reporter:
 
 Use `host:port` entries with numeric ports from 1 to 65535 and brackets around
 IPv6 addresses (`[::1]:11800`). The agent trims whitespace, ignores empty entries,
-and removes duplicates. Unlike the Python and Node.js parsers, Go rejects a
-malformed list instead of silently dropping its invalid entries. A list that
-normalizes to one address uses the existing single-address connection behavior.
+and removes duplicates. Invalid entries in a comma-separated list are skipped
+with a warning during initialization, following the Python and Node.js parsing
+policy. These warnings are not repeated when reconnecting. A list that normalizes
+to one address uses the existing single-address connection behavior. If no valid
+entries remain, the agent warns and disables reporting; the application continues
+running without a reporter initialization error or panic.
 
 For multiple addresses, the agent creates one gRPC channel and shuffles its
 static endpoint list once. Native `pick_first` selects the first reachable
@@ -58,7 +61,7 @@ proxy behavior.
 
 ## TLS / SNI
 
-The first configured endpoint after normalization supplies the channel's fixed
+The first valid configured endpoint after normalization supplies the channel's fixed
 HTTP/2 `:authority`, including its port. TLS uses that endpoint's host for
 certificate verification and SNI where applicable. Shuffling or failing over
 does not change this identity. An explicit server-name override in transport

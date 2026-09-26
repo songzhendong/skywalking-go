@@ -78,7 +78,22 @@ func NewConnectionManager(logger operator.LogOperator, checkInterval time.Durati
 		creds:         creds,
 		connManager:   make(map[string]*ManagedConnection),
 		mu:            sync.RWMutex{},
-		multiBackend:  isMultiBackendService(serverAddr),
+	}
+	// Normalize comma-separated lists once so skipped-entry warnings are not
+	// repeated when channels are acquired or the resolver refreshes.
+	if strings.Contains(serverAddr, ",") {
+		backends, err := parseBackendServiceList(serverAddr, logger)
+		if err != nil {
+			if logger != nil {
+				logger.Warnf("%v; reporter is disabled", err)
+			}
+			return nil, err
+		}
+		c.backends = backends
+		c.multiBackend = len(backends) >= 2
+		if !c.multiBackend {
+			c.serverAddr = backends[0]
+		}
 	}
 	// Auth-failure throttled logs are multi-backend only (same path as the interceptor).
 	if c.multiBackend {
@@ -95,6 +110,7 @@ type ConnectionManager struct {
 	creds         credentials.TransportCredentials
 	connManager   map[string]*ManagedConnection
 	mu            sync.RWMutex
+	backends      []string
 
 	// multi-backend only (true when config normalizes to ≥2 addresses)
 	multiBackend         bool
@@ -154,8 +170,9 @@ func (cm *ConnectionManager) GetConnection(serverAddr string) (*grpc.ClientConn,
 }
 
 func (cm *ConnectionManager) createConnection() (*grpc.ClientConn, error) {
-	// Historical single-address path: dial the configured string unchanged.
-	if !strings.Contains(cm.serverAddr, ",") {
+	// Historical single-address options also apply when filtering leaves one
+	// endpoint. Standalone gRPC targets keep their original resolver semantics.
+	if !cm.multiBackend {
 		var credsDialOption grpc.DialOption
 		if cm.creds != nil {
 			// use tls
@@ -176,33 +193,7 @@ func (cm *ConnectionManager) createConnection() (*grpc.ClientConn, error) {
 		return conn, err
 	}
 
-	backends, parseErr := parseBackendServiceList(cm.serverAddr)
-	if parseErr != nil {
-		if cm.logger != nil {
-			cm.logger.Errorf("parse multi-backend service %q failed: %v", cm.serverAddr, parseErr)
-		}
-		return nil, fmt.Errorf("parse backend service: %w", parseErr)
-	}
-	// Comma present but only one address left after normalize: dial that host
-	// with the same ConnectParams shape as the historical single-address path.
-	if len(backends) == 1 {
-		var credsDialOption grpc.DialOption
-		if cm.creds != nil {
-			credsDialOption = grpc.WithTransportCredentials(cm.creds)
-		} else {
-			credsDialOption = grpc.WithTransportCredentials(insecure.NewCredentials())
-		}
-		return grpc.Dial(backends[0], credsDialOption, grpc.WithConnectParams(grpc.ConnectParams{
-			Backoff: backoff.Config{
-				BaseDelay:  1.0 * time.Second,
-				Multiplier: 1.6,
-				Jitter:     0.2,
-				MaxDelay:   cm.checkInterval,
-			},
-		}))
-	}
-
-	return cm.dialMultiBackend(backends)
+	return cm.dialMultiBackend(cm.backends)
 }
 
 func (cm *ConnectionManager) dialMultiBackend(backends []string) (*grpc.ClientConn, error) {
@@ -239,7 +230,7 @@ func (cm *ConnectionManager) dialMultiBackend(backends []string) (*grpc.ClientCo
 // multiBackendDialOptions configures the static pick_first resolver path used
 // only when backend_service lists two or more addresses.
 func (cm *ConnectionManager) multiBackendDialOptions(backends []string) (string, []grpc.DialOption, error) {
-	builder, buildErr := newStaticBackendResolverBuilder(cm.logger, cm.serverAddr, cm.storeResolvedBackendAddresses)
+	builder, buildErr := newStaticBackendResolverBuilder(cm.logger, backends, cm.storeResolvedBackendAddresses)
 	if buildErr != nil {
 		if cm.logger != nil {
 			cm.logger.Errorf("create static multi-backend resolver for %q failed: %v",

@@ -37,18 +37,14 @@ type staticBackendResolverBuilder struct {
 	onResolved  func(addrs []string)
 }
 
-func newStaticBackendResolverBuilder(logger operator.LogOperator, serverAddr string,
+func newStaticBackendResolverBuilder(logger operator.LogOperator, backends []string,
 	onResolved func(addrs []string)) (*staticBackendResolverBuilder, error) {
-	backends, err := parseBackendServiceList(serverAddr)
-	if err != nil {
-		return nil, err
-	}
 	if len(backends) < 2 {
 		return nil, fmt.Errorf("static multi-backend resolver requires at least 2 addresses")
 	}
 	return &staticBackendResolverBuilder{
 		logger:      logger,
-		backends:    backends,
+		backends:    append([]string(nil), backends...),
 		targetValue: fmt.Sprintf("%s:///%s", staticBackendScheme, strings.Join(backends, ",")),
 		onResolved:  onResolved,
 	}, nil
