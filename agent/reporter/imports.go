@@ -23,6 +23,7 @@ import (
 	_ "context"
 	_ "crypto/tls"
 	_ "crypto/x509"
+	_ "errors"
 	_ "fmt"
 	_ "io"
 	_ "net"
