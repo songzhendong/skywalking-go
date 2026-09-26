@@ -18,6 +18,7 @@ package reporter
 
 import (
 	"fmt"
+	"math/rand"
 	"strings"
 
 	"google.golang.org/grpc/resolver"
@@ -57,6 +58,11 @@ func newStaticBackendResolverBuilder(logger operator.LogOperator, serverAddr str
 func (b *staticBackendResolverBuilder) Build(target resolver.Target, cc resolver.ClientConn,
 	opts resolver.BuildOptions) (resolver.Resolver, error) {
 	addresses := configuredAddressesAsResolverState(b.backends)
+	// grpc-go 1.55 lacks pick_first.shuffleAddressList. Shuffle once per channel
+	// and reuse this order for ResolveNow so healthy connections stay sticky.
+	rand.Shuffle(len(addresses), func(i, j int) {
+		addresses[i], addresses[j] = addresses[j], addresses[i]
+	})
 	if err := cc.UpdateState(resolver.State{Addresses: addresses}); err != nil {
 		return nil, fmt.Errorf("static backend resolver UpdateState rejected by ClientConn: %w", err)
 	}

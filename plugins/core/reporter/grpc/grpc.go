@@ -20,12 +20,14 @@ package grpc
 import (
 	"context"
 	"io"
-	"sync"
 	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 
 	"github.com/apache/skywalking-go/plugins/core/operator"
 	"github.com/apache/skywalking-go/plugins/core/reporter"
@@ -52,7 +54,10 @@ func NewGRPCReporter(logger operator.LogOperator,
 	pprofTaskManager *reporter.PprofTaskManager,
 	opts ...ReporterOption,
 ) (reporter.Reporter, error) {
+	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
 	r := &gRPCReporter{
+		shutdownCtx:          shutdownCtx,
+		shutdownCancel:       shutdownCancel,
 		logger:               logger,
 		serverAddr:           serverAddr,
 		tracingSendCh:        make(chan *agentv3.SegmentObject, maxSendQueueSize),
@@ -70,6 +75,7 @@ func NewGRPCReporter(logger operator.LogOperator,
 	r.lastProfileCommandTime = -1
 	conn, err := connManager.GetConnection(serverAddr)
 	if err != nil {
+		shutdownCancel()
 		return nil, err
 	}
 	r.serviceClients.Store(newGrpcServiceClients(conn))
@@ -117,11 +123,10 @@ type gRPCReporter struct {
 	connManager      *reporter.ConnectionManager
 	cdsManager       *reporter.CDSManager
 	pprofTaskManager *reporter.PprofTaskManager
-	// lastMultiRecreateUnixNano rate-limits RecreateConnection after send failures.
-	lastMultiRecreateUnixNano atomic.Int64
-	multiReconnectMu          sync.Mutex
-	// serviceClients holds the latest stub bundle; swapped atomically on recreate.
+	// serviceClients holds the latest stub bundle; published atomically.
 	serviceClients atomic.Pointer[grpcServiceClients]
+	shutdownCtx    context.Context
+	shutdownCancel context.CancelFunc
 }
 
 func (r *gRPCReporter) clients() *grpcServiceClients {
@@ -195,12 +200,18 @@ func (r *gRPCReporter) SendLog(log *logv3.LogData) {
 }
 
 func (r *gRPCReporter) Close() {
+	if r.connManager.IsMultiBackend() && r.shutdownCancel != nil {
+		r.shutdownCancel()
+	}
 	if r.bootFlag {
 		if r.tracingSendCh != nil {
 			close(r.tracingSendCh)
 		}
 		if r.metricsSendCh != nil {
 			close(r.metricsSendCh)
+		}
+		if r.connManager.IsMultiBackend() && r.logSendCh != nil {
+			close(r.logSendCh)
 		}
 	} else {
 		r.closeGRPCConn()
@@ -250,85 +261,83 @@ func (r *gRPCReporter) kickMultiBackendConnect() {
 		return
 	}
 	if conn := r.connManager.PeekConnection(r.serverAddr); conn != nil {
-		conn.Connect()
+		state := conn.GetState()
+		if state == connectivity.Idle || state == connectivity.TransientFailure {
+			conn.Connect()
+		}
 	}
 }
 
-// reconnectMultiBackend closes and redials the multi-backend channel so
-// pick_first can leave a half-open active peer (Ready with a dead TCP connection)
-// and bind to the standby. Rate-limited to avoid recreate storms; dial failures
-// clear the rate-limit stamp so the next send can retry immediately.
-func (r *gRPCReporter) reconnectMultiBackend() {
-	if !r.connManager.IsMultiBackend() {
+// reportMultiBackendError leaves transport recovery to gRPC. An RPC failure
+// does not mean the active backend is unreachable, and closing the shared
+// channel would also interrupt healthy telemetry streams.
+func (r *gRPCReporter) reportMultiBackendError(operation string, err error) {
+	switch status.Code(err) {
+	case codes.Unauthenticated, codes.PermissionDenied:
+		// The connection interceptor already emits a throttled diagnostic.
 		return
+	default:
+		r.logger.Errorf("%s: %v", operation, err)
 	}
-	r.multiReconnectMu.Lock()
-	defer r.multiReconnectMu.Unlock()
-
-	now := time.Now().UnixNano()
-	last := r.lastMultiRecreateUnixNano.Load()
-	if last != 0 && now-last < int64(time.Second) {
-		r.kickMultiBackendConnect()
-		r.bindMultiBackendClientsLocked()
-		return
-	}
-	if !r.lastMultiRecreateUnixNano.CompareAndSwap(last, now) {
-		r.kickMultiBackendConnect()
-		r.bindMultiBackendClientsLocked()
-		return
-	}
-	if err := r.connManager.RecreateConnection(r.serverAddr); err != nil {
-		r.logger.Errorf("recreate multi-backend connection: %v", err)
-		r.lastMultiRecreateUnixNano.Store(0)
-		r.kickMultiBackendConnect()
-		return
-	}
-	r.bindMultiBackendClientsLocked()
+	r.kickMultiBackendConnect()
 }
 
-// bindMultiBackendClientsLocked refreshes service clients when PeekConnection
-// returns a different ClientConn. Caller must hold multiReconnectMu.
-// The new bundle is published atomically so send/heartbeat goroutines never
-// race on interface field writes.
-func (r *gRPCReporter) bindMultiBackendClientsLocked() {
+// Wait before taking more telemetry out of the queue during a transport outage.
+// RPC errors on a Ready channel do not enter this wait or change backend order.
+func (r *gRPCReporter) waitForMultiBackendReady() bool {
+	ctx := r.shutdownCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	conn := r.connManager.PeekConnection(r.serverAddr)
 	if conn == nil {
-		return
+		return false
 	}
-	if cur := r.serviceClients.Load(); cur != nil && cur.conn == conn {
-		return
-	}
-	r.serviceClients.Store(newGrpcServiceClients(conn))
-}
-
-// multiBackendTraceSendLoop reports each segment on its own Collect stream
-// (open → Send → CloseAndRecv). A long-lived stream can look successful on a
-// half-open peer after docker kill; per-segment Collect forces pick_first to
-// re-select and surfaces errors via CloseAndRecv.
-func (r *gRPCReporter) multiBackendTraceSendLoop() {
-	for s := range r.tracingSendCh {
-		// Do not exit on Shutdown: RecreateConnection used to delete the map
-		// entry and look like Shutdown, which permanently stopped this loop.
-		// Real teardown closes tracingSendCh; range exit handles that.
-		// Keep a switch/case (not ==) so agent copy can strip the reporter.
-		// prefix; default satisfies gocritic singleCaseSwitch.
-		switch r.connManager.GetConnectionStatus(r.serverAddr) {
-		case reporter.ConnectionStatusDisconnect:
-			time.Sleep(time.Second)
+	for ctx.Err() == nil {
+		state := conn.GetState()
+		switch state {
+		case connectivity.Ready:
+			return true
+		case connectivity.Shutdown:
+			return false
+		case connectivity.Idle:
+			conn.Connect()
 		default:
 		}
-		if err := r.sendTraceSegmentMulti(s); err != nil {
-			r.logger.Errorf("send segment error %v", err)
-			r.reconnectMultiBackend()
-			if err2 := r.sendTraceSegmentMulti(s); err2 != nil {
-				r.logger.Errorf("retry send segment error %v", err2)
-			}
+		if !conn.WaitForStateChange(ctx, state) {
+			return false
 		}
 	}
-	r.closeGRPCConn()
+	return false
 }
 
-func (r *gRPCReporter) sendTraceSegmentMulti(s *agentv3.SegmentObject) error {
+// multiBackendTraceSendLoop sends a snapshot of the queue on each Collect
+// stream. Batching amortizes acknowledgements without replaying a failed batch.
+func (r *gRPCReporter) multiBackendTraceSendLoop() {
+	defer r.closeGRPCConn()
+	for r.waitForMultiBackendReady() {
+		s, ok := <-r.tracingSendCh
+		if !ok {
+			return
+		}
+		if !r.waitForMultiBackendReady() {
+			return
+		}
+		queued := len(r.tracingSendCh)
+		segments := make([]*agentv3.SegmentObject, 1, queued+1)
+		segments[0] = s
+		for i := 0; i < queued; i++ {
+			segments = append(segments, <-r.tracingSendCh)
+		}
+		if err := r.sendTraceSegmentsMulti(segments); err != nil {
+			// A failed acknowledgement may follow successful ingestion. Do not
+			// replay this segment: OAP does not deduplicate Collect requests.
+			r.reportMultiBackendError("send segment error", err)
+		}
+	}
+}
+
+func (r *gRPCReporter) sendTraceSegmentsMulti(segments []*agentv3.SegmentObject) error {
 	c := r.clients()
 	if c == nil {
 		return io.ErrUnexpectedEOF
@@ -342,16 +351,14 @@ func (r *gRPCReporter) sendTraceSegmentMulti(s *agentv3.SegmentObject) error {
 		}
 		return err
 	}
-	recovered, sendErr := r.sendWithRecover(func() error {
-		return reporter.MultiBackendSend(cancel, func() error { return stream.Send(s) }, 0)
-	})
-	if recovered {
-		cancel()
-		return nil
-	}
-	if sendErr != nil {
-		cancel()
-		return sendErr
+	for _, segment := range segments {
+		recovered, sendErr := r.pipelineSend(cancel, func() error { return stream.Send(segment) })
+		if recovered {
+			continue
+		}
+		if sendErr != nil {
+			return sendErr
+		}
 	}
 	// CloseAndRecv must not block forever on a half-open peer after docker kill.
 	closeErr := reporter.MultiBackendSend(cancel, func() error {
@@ -381,9 +388,12 @@ func (r *gRPCReporter) initSendPipeline() {
 		}
 	StreamLoop:
 		for {
+			if r.connManager.IsMultiBackend() && !r.waitForMultiBackendReady() {
+				return
+			}
 			switch r.connManager.GetConnectionStatus(r.serverAddr) {
 			case reporter.ConnectionStatusShutdown:
-				break
+				return
 			case reporter.ConnectionStatusDisconnect:
 				time.Sleep(5 * time.Second)
 				continue StreamLoop
@@ -428,9 +438,12 @@ func (r *gRPCReporter) initSendPipeline() {
 		}()
 	StreamLoop:
 		for {
+			if r.connManager.IsMultiBackend() && !r.waitForMultiBackendReady() {
+				return
+			}
 			switch r.connManager.GetConnectionStatus(r.serverAddr) {
 			case reporter.ConnectionStatusShutdown:
-				break
+				return
 			case reporter.ConnectionStatusDisconnect:
 				time.Sleep(5 * time.Second)
 				continue StreamLoop
@@ -456,12 +469,11 @@ func (r *gRPCReporter) initSendPipeline() {
 					if err == nil {
 						err = ctx.Err()
 					}
-					r.logger.Errorf("open stream error %v", err)
-					r.reconnectMultiBackend()
+					r.reportMultiBackendError("open stream error", err)
 					time.Sleep(5 * time.Second)
 					continue StreamLoop
 				}
-				go reporter.WatchConnCancelOnUnready(ctx, cancel, r.connManager.PeekConnection(r.serverAddr))
+				go reporter.WatchConnCancelOnUnready(ctx, cancel, c.conn)
 			} else {
 				stream, err = c.metrics.CollectBatch(metadata.NewOutgoingContext(context.Background(), r.connManager.GetMD()))
 				if err != nil {
@@ -478,13 +490,13 @@ func (r *gRPCReporter) initSendPipeline() {
 					continue
 				}
 				if sendErr != nil {
-					r.logger.Errorf("send metrics error %v", sendErr)
 					// Cancel before CloseAndRecv: on multi-backend a half-open peer
 					// can hang CloseAndRecv forever and block reconnect.
 					cancel()
 					if r.connManager.IsMultiBackend() {
-						r.reconnectMultiBackend()
+						r.reportMultiBackendError("send metrics error", sendErr)
 					} else {
+						r.logger.Errorf("send metrics error %v", sendErr)
 						r.closeMetricsStream(stream)
 					}
 					continue StreamLoop
@@ -505,9 +517,12 @@ func (r *gRPCReporter) initSendPipeline() {
 		}()
 	StreamLoop:
 		for {
+			if r.connManager.IsMultiBackend() && !r.waitForMultiBackendReady() {
+				return
+			}
 			switch r.connManager.GetConnectionStatus(r.serverAddr) {
 			case reporter.ConnectionStatusShutdown:
-				break
+				return
 			case reporter.ConnectionStatusDisconnect:
 				time.Sleep(5 * time.Second)
 				continue StreamLoop
@@ -533,12 +548,11 @@ func (r *gRPCReporter) initSendPipeline() {
 					if err == nil {
 						err = ctx.Err()
 					}
-					r.logger.Errorf("open stream error %v", err)
-					r.reconnectMultiBackend()
+					r.reportMultiBackendError("open stream error", err)
 					time.Sleep(5 * time.Second)
 					continue StreamLoop
 				}
-				go reporter.WatchConnCancelOnUnready(ctx, cancel, r.connManager.PeekConnection(r.serverAddr))
+				go reporter.WatchConnCancelOnUnready(ctx, cancel, c.conn)
 			} else {
 				stream, err = c.log.Collect(metadata.NewOutgoingContext(context.Background(), r.connManager.GetMD()))
 				if err != nil {
@@ -553,11 +567,11 @@ func (r *gRPCReporter) initSendPipeline() {
 					continue
 				}
 				if sendErr != nil {
-					r.logger.Errorf("send log error %v", sendErr)
 					cancel()
 					if r.connManager.IsMultiBackend() {
-						r.reconnectMultiBackend()
+						r.reportMultiBackendError("send log error", sendErr)
 					} else {
+						r.logger.Errorf("send log error %v", sendErr)
 						r.closeLogStream(stream)
 					}
 					continue StreamLoop
@@ -579,9 +593,12 @@ func (r *gRPCReporter) initSendPipeline() {
 
 	StreamLoop:
 		for {
+			if r.connManager.IsMultiBackend() && !r.waitForMultiBackendReady() {
+				return
+			}
 			switch r.connManager.GetConnectionStatus(r.serverAddr) {
 			case reporter.ConnectionStatusShutdown:
-				break
+				return
 			case reporter.ConnectionStatusDisconnect:
 				time.Sleep(5 * time.Second)
 				continue StreamLoop
@@ -607,12 +624,11 @@ func (r *gRPCReporter) initSendPipeline() {
 					if err == nil {
 						err = ctx.Err()
 					}
-					r.logger.Errorf("open profile stream error %v", err)
-					r.reconnectMultiBackend()
+					r.reportMultiBackendError("open profile stream error", err)
 					time.Sleep(5 * time.Second)
 					continue StreamLoop
 				}
-				go reporter.WatchConnCancelOnUnready(ctx, cancel, r.connManager.PeekConnection(r.serverAddr))
+				go reporter.WatchConnCancelOnUnready(ctx, cancel, c.conn)
 			} else {
 				stream, err = c.profile.GoProfileReport(metadata.NewOutgoingContext(context.Background(), r.connManager.GetMD()))
 				if err != nil {
@@ -636,11 +652,11 @@ func (r *gRPCReporter) initSendPipeline() {
 					continue
 				}
 				if sendErr != nil {
-					r.logger.Errorf("send profile data error %v", sendErr)
 					cancel()
 					if r.connManager.IsMultiBackend() {
-						r.reconnectMultiBackend()
+						r.reportMultiBackendError("send profile data error", sendErr)
 					} else {
+						r.logger.Errorf("send profile data error %v", sendErr)
 						r.closeProfileStream(stream)
 					}
 					continue StreamLoop
@@ -725,6 +741,26 @@ func (r *gRPCReporter) reportInstanceProperties() (err error) {
 	return err
 }
 
+func (r *gRPCReporter) sendKeepAlive() error {
+	c := r.clients()
+	if c == nil {
+		return io.ErrUnexpectedEOF
+	}
+	ctx := context.Background()
+	cancel := func() {}
+	if r.connManager.IsMultiBackend() {
+		ctx, cancel = reporter.BackendRPCContext(r.serverAddr, r.checkInterval)
+	}
+	defer cancel()
+	_, err := c.management.KeepAlive(
+		metadata.NewOutgoingContext(ctx, r.connManager.GetMD()),
+		&managementv3.InstancePingPkg{
+			Service:         r.entity.ServiceName,
+			ServiceInstance: r.entity.ServiceInstanceName,
+		})
+	return err
+}
+
 func (r *gRPCReporter) check() {
 	if r.checkInterval < 0 || r.clients() == nil {
 		return
@@ -736,46 +772,43 @@ func (r *gRPCReporter) check() {
 			}
 		}()
 		instancePropertiesSubmitted := false
+		propertyRefreshHeartbeats := 0
 		for {
 			switch r.connManager.GetConnectionStatus(r.serverAddr) {
 			case reporter.ConnectionStatusShutdown:
-				break
+				return
 			case reporter.ConnectionStatusDisconnect:
+				if r.connManager.IsMultiBackend() {
+					instancePropertiesSubmitted = false
+				}
 				time.Sleep(r.checkInterval)
 				continue
 			}
 
-			if !instancePropertiesSubmitted {
+			if !instancePropertiesSubmitted || (r.connManager.IsMultiBackend() && propertyRefreshHeartbeats >= 10) {
 				err := r.reportInstanceProperties()
 				if err != nil {
-					r.logger.Errorf("report serviceInstance properties error %v", err)
-					time.Sleep(r.checkInterval)
-					continue
+					if r.connManager.IsMultiBackend() {
+						r.reportMultiBackendError("report serviceInstance properties error", err)
+					} else {
+						r.logger.Errorf("report serviceInstance properties error %v", err)
+						time.Sleep(r.checkInterval)
+						continue
+					}
+				} else {
+					instancePropertiesSubmitted = true
+					propertyRefreshHeartbeats = 0
 				}
-				instancePropertiesSubmitted = true
 			}
 
-			c := r.clients()
-			if c == nil {
-				time.Sleep(r.checkInterval)
-				continue
+			if err := r.sendKeepAlive(); err != nil {
+				if r.connManager.IsMultiBackend() {
+					r.reportMultiBackendError("send keep alive signal error", err)
+				} else {
+					r.logger.Errorf("send keep alive signal error %v", err)
+				}
 			}
-			ctx := context.Background()
-			cancel := func() {}
-			if r.connManager.IsMultiBackend() {
-				ctx, cancel = reporter.BackendRPCContext(r.serverAddr, r.checkInterval)
-			}
-			_, err := c.management.KeepAlive(
-				metadata.NewOutgoingContext(ctx, r.connManager.GetMD()),
-				&managementv3.InstancePingPkg{
-					Service:         r.entity.ServiceName,
-					ServiceInstance: r.entity.ServiceInstanceName,
-				})
-			cancel()
-
-			if err != nil {
-				r.logger.Errorf("send keep alive signal error %v", err)
-			}
+			propertyRefreshHeartbeats++
 			time.Sleep(r.checkInterval)
 		}
 	}()

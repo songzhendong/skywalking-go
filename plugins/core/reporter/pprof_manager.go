@@ -349,14 +349,8 @@ func (r *PprofTaskManager) uploadPprofData(pprofData *pprofv10.PprofData) {
 		return
 	}
 	r.logger.Errorf("failed to upload pprof: %v", err)
-	if r.connManager == nil || !r.connManager.IsMultiBackend() {
-		return
-	}
-	// Refresh stub from the current ClientConn and retry once after recreate/failover.
-	_ = r.currentPprofClient()
-	if err := r.uploadPprofDataOnce(pprofData); err != nil {
-		r.logger.Errorf("retry upload pprof failed: %v", err)
-	}
+	// The collector may already have accepted chunks before the failure.
+	// Keep the channel and let the next upload use its recovered transport.
 }
 
 func (r *PprofTaskManager) uploadPprofDataOnce(pprofData *pprofv10.PprofData) error {

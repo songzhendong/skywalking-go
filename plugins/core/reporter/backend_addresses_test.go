@@ -17,13 +17,17 @@
 package reporter
 
 import (
+	"context"
 	"net"
+	"reflect"
+	"sort"
 	"sync"
 	"testing"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/serviceconfig"
@@ -82,33 +86,74 @@ func hasExactAddresses(state resolver.State, want []string) bool {
 	if len(state.Addresses) != len(want) {
 		return false
 	}
-	for i := range want {
-		if state.Addresses[i].Addr != want[i] {
-			return false
+	got := make([]string, len(state.Addresses))
+	for i, addr := range state.Addresses {
+		got[i] = addr.Addr
+	}
+	want = append([]string(nil), want...)
+	sort.Strings(got)
+	sort.Strings(want)
+	return reflect.DeepEqual(got, want)
+}
+
+func TestBackendAuthorityFollowsFirstConfiguredEndpoint(t *testing.T) {
+	cases := map[string][]string{
+		"hostnames": {testBackendAddrA, testBackendAddrB},
+		"mixed":     {testIPLiteralAddr, testBackendAddr},
+		"ipv4":      {testIPLiteralAddr, "10.0.0.2:11800"},
+		"ipv6":      {"[2001:db8::1]:11800", "[2001:db8::2]:11800"},
+	}
+	for name, backends := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := firstBackendAuthority(backends); got != backends[0] {
+				t.Fatalf("authority=%q, want %q", got, backends[0])
+			}
+			addrs := configuredAddressesAsResolverState(backends)
+			if !hasExactAddresses(resolver.State{Addresses: addrs}, backends) {
+				t.Fatalf("addresses=%+v", addrs)
+			}
+			for _, addr := range addrs {
+				if addr.ServerName != "" {
+					t.Fatalf("endpoint %q overrides fixed authority with %q", addr.Addr, addr.ServerName)
+				}
+			}
+		})
+	}
+}
+
+func TestStaticMultiBackendKeepsOrderAcrossResolveNow(t *testing.T) {
+	var published []string
+	raw := testMultiBackendCSV + "," + testIPLiteralAddr
+	builder, err := newStaticBackendResolverBuilder(nil, raw, func(addrs []string) { published = addrs })
+	if err != nil {
+		t.Fatal(err)
+	}
+	cc := &testResolverClientConn{}
+	r, err := builder.Build(resolver.Target{}, cc, resolver.BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	initial := append([]resolver.Address(nil), cc.lastState().Addresses...)
+	if !hasExactAddresses(cc.lastState(), []string{testBackendAddrA, testBackendAddrB, testIPLiteralAddr}) {
+		t.Fatalf("shuffled addresses=%+v", initial)
+	}
+	if len(published) != len(initial) {
+		t.Fatalf("published=%v", published)
+	}
+	for i, addr := range initial {
+		if addr.Addr != published[i] {
+			t.Fatalf("published order=%v, resolver order=%v", published, initial)
 		}
 	}
-	return true
-}
-
-func TestFirstHostnameAuthority(t *testing.T) {
-	if got := firstHostnameAuthority([]string{testIPLiteralAddr, testBackendAddr}); got != testBackendHost {
-		t.Fatalf("got %q", got)
+	for i := 0; i < 10; i++ {
+		r.ResolveNow(resolver.ResolveNowOptions{})
+		if !reflect.DeepEqual(cc.lastState().Addresses, initial) {
+			t.Fatalf("ResolveNow changed order from %v to %v", initial, cc.lastState().Addresses)
+		}
 	}
-	if got := firstHostnameAuthority([]string{testIPLiteralAddr, "10.0.0.2:11800"}); got != "" {
-		t.Fatalf("got %q, want empty", got)
-	}
-}
-
-func TestConfiguredAddressesUseHostnameSNIForIPLiterals(t *testing.T) {
-	addrs := configuredAddressesAsResolverState([]string{testIPLiteralAddr, testBackendAddr})
-	if len(addrs) != 2 {
-		t.Fatalf("len=%d", len(addrs))
-	}
-	if addrs[0].Addr != testIPLiteralAddr || addrs[0].ServerName != testBackendHost {
-		t.Fatalf("ip entry = %+v", addrs[0])
-	}
-	if addrs[1].ServerName != testBackendHost {
-		t.Fatalf("host entry ServerName = %q", addrs[1].ServerName)
+	if got := builder.target(); got != staticBackendScheme+":///"+raw {
+		t.Fatalf("shuffle changed target/authority: %q", got)
 	}
 }
 
@@ -141,6 +186,79 @@ func TestIsIPLiteralHost(t *testing.T) {
 	}
 	if isIPLiteralHost(testBackendHost) || isIPLiteralHost("") {
 		t.Fatal("expected non-IP")
+	}
+}
+
+func TestBackendServicePortValidation(t *testing.T) {
+	for _, port := range []string{"0", "65536", "grpc", "1.5", "+11800", "-1"} {
+		if _, err := parseBackendServiceList("oap:" + port + "," + testBackendAddr); err == nil {
+			t.Errorf("accepted invalid port %q", port)
+		}
+	}
+	got, err := parseBackendServiceList("oap:011800,oap:11800")
+	if err != nil || len(got) != 1 || got[0] != "oap:11800" {
+		t.Fatalf("port normalization: %v, %v", got, err)
+	}
+}
+
+type recordingAuthorityCredentials struct {
+	credentials.TransportCredentials
+	serverName  string
+	authorities chan string
+}
+
+func (c *recordingAuthorityCredentials) Info() credentials.ProtocolInfo {
+	info := c.TransportCredentials.Info()
+	info.ServerName = c.serverName
+	return info
+}
+
+func (c *recordingAuthorityCredentials) Clone() credentials.TransportCredentials {
+	return &recordingAuthorityCredentials{
+		TransportCredentials: c.TransportCredentials.Clone(), serverName: c.serverName, authorities: c.authorities,
+	}
+}
+
+func (c *recordingAuthorityCredentials) ClientHandshake(ctx context.Context, authority string,
+	conn net.Conn) (net.Conn, credentials.AuthInfo, error) {
+	c.authorities <- authority
+	return c.TransportCredentials.ClientHandshake(ctx, authority, conn)
+}
+
+func TestMultiBackendChannelAuthority(t *testing.T) {
+	a, aServer := serveTrace(t, &countingTraceServer{})
+	defer a.Close()
+	defer aServer.Stop()
+	b, bServer := serveTrace(t, &countingTraceServer{})
+	defer b.Close()
+	defer bServer.Stop()
+	backends := a.Addr().String() + "," + b.Addr().String()
+	for _, override := range []string{"", "common.example.com"} {
+		t.Run("override="+override, func(t *testing.T) {
+			creds := &recordingAuthorityCredentials{
+				TransportCredentials: insecure.NewCredentials(), serverName: override, authorities: make(chan string, 10),
+			}
+			cm, err := NewConnectionManager(nil, time.Second, backends, "", creds)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cm.Close()
+			if _, err := cm.GetConnection(backends); err != nil {
+				t.Fatal(err)
+			}
+			want := a.Addr().String()
+			if override != "" {
+				want = override
+			}
+			select {
+			case got := <-creds.authorities:
+				if got != want {
+					t.Fatalf("handshake authority=%q, want %q", got, want)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("transport handshake did not start")
+			}
+		})
 	}
 }
 

@@ -120,9 +120,7 @@ func (cm *ConnectionManager) IsMultiBackend() bool {
 }
 
 func (cm *ConnectionManager) GetConnection(serverAddr string) (*grpc.ClientConn, error) {
-	// Same mutex as RecreateConnection / ReleaseConnection / PeekConnection:
-	// unlocked map+refCount access raced with multi-backend recreate at runtime
-	// and with concurrent GetConnection from reporter/CDS/pprof at boot.
+	// Serialize reference counts and map access across acquisition and release.
 	cm.mu.Lock()
 	if managed, exists := cm.connManager[serverAddr]; exists {
 		managed.refCount++
@@ -241,11 +239,6 @@ func (cm *ConnectionManager) dialMultiBackend(backends []string) (*grpc.ClientCo
 // multiBackendDialOptions configures the static pick_first resolver path used
 // only when backend_service lists two or more addresses.
 func (cm *ConnectionManager) multiBackendDialOptions(backends []string) (string, []grpc.DialOption, error) {
-	if cm.creds != nil && firstHostnameAuthority(backends) == "" && cm.logger != nil {
-		cm.logger.Warnf("multi-backend TLS list %q has no hostname; "+
-			"SNI/ServerName may not match certificates (prefer at least one hostname entry)",
-			cm.serverAddr)
-	}
 	builder, buildErr := newStaticBackendResolverBuilder(cm.logger, cm.serverAddr, cm.storeResolvedBackendAddresses)
 	if buildErr != nil {
 		if cm.logger != nil {
@@ -259,6 +252,11 @@ func (cm *ConnectionManager) multiBackendDialOptions(backends []string) (string,
 		grpc.WithDefaultServiceConfig(multiBackendServiceConfig),
 		// Node sets grpc.enable_http_proxy=0 for multi-address channels.
 		grpc.WithContextDialer(directTCPContextDialer),
+	}
+	// Capture authority before shuffling. Explicit transport credentials retain
+	// their override; gRPC rejects a conflicting WithAuthority value.
+	if cm.creds == nil || cm.creds.Info().ServerName == "" {
+		opts = append(opts, grpc.WithAuthority(firstBackendAuthority(backends)))
 	}
 	if cm.authFailures != nil {
 		opts = append(opts,
@@ -325,22 +323,34 @@ func SetMultiBackendSendCancelGraceForTest(d time.Duration) {
 // Send still runs in one helper goroutine so a half-open peer that ignores
 // cancel cannot block the reporter past timeout+grace.
 //
-// done is buffered so that if we return after grace while send is still
-// blocked, the send goroutine can later exit without a second drain goroutine
-// (Codex P2). RecreateConnection closes the old ClientConn to unblock it.
+// The buffered result lets the worker finish after the caller times out.
+// Recover in the worker and re-panic in the caller so reporter recovery still
+// protects the application from protobuf encoding panics.
 func MultiBackendSend(cancel context.CancelFunc, send func() error, timeout time.Duration) error {
 	if timeout <= 0 {
 		timeout = multiBackendSendTimeout
 	}
-	done := make(chan error, 1)
+	type sendResult struct {
+		err        error
+		panicValue interface{}
+	}
+	done := make(chan sendResult, 1)
 	go func() {
-		done <- send()
+		result := sendResult{}
+		defer func() {
+			result.panicValue = recover()
+			done <- result
+		}()
+		result.err = send()
 	}()
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
-	case err := <-done:
-		return err
+	case result := <-done:
+		if result.panicValue != nil {
+			panic(result.panicValue)
+		}
+		return result.err
 	case <-timer.C:
 		if cancel != nil {
 			cancel()
@@ -348,9 +358,12 @@ func MultiBackendSend(cancel context.CancelFunc, send func() error, timeout time
 		grace := time.NewTimer(multiBackendSendCancelGrace)
 		defer grace.Stop()
 		select {
-		case err := <-done:
-			if err != nil {
-				return err
+		case result := <-done:
+			if result.panicValue != nil {
+				panic(result.panicValue)
+			}
+			if result.err != nil {
+				return result.err
 			}
 			return errMultiBackendSendTimeout
 		case <-grace.C:
@@ -472,8 +485,8 @@ func (cm *ConnectionManager) checkConnectionStatus(serverAddr string) {
 	}
 }
 
-// checkMultiBackendConnectionStatus keeps reporter RPCs eligible while pick_first
-// moves off a dead backend, and kicks Idle/TF with Connect().
+// checkMultiBackendConnectionStatus nudges idle channels. Reporting readiness is
+// read directly from the transport by GetConnectionStatus.
 func (cm *ConnectionManager) checkMultiBackendConnectionStatus(serverAddr string) {
 	for {
 		cm.mu.Lock()
@@ -483,25 +496,13 @@ func (cm *ConnectionManager) checkMultiBackendConnectionStatus(serverAddr string
 			return
 		}
 		conn := managed.connection
-		oldStatus := managed.status
 		checkInterval := cm.checkInterval
 		cm.mu.Unlock()
 
 		state := conn.GetState()
-		// Never Connect() a Shutdown ClientConn (closed after Recreate swap or
-		// Close). Recovery is RecreateConnection on the send path, or map delete
-		// on Release. Still report Connected while the map entry exists so
-		// CDS/pprof/send loops do not exit permanently mid-failover.
+		// Never Connect a channel already closed by teardown.
 		if state == connectivity.Idle || state == connectivity.TransientFailure {
 			conn.Connect()
-		}
-		newStatus := ConnectionStatusConnected
-		if newStatus != oldStatus {
-			cm.mu.Lock()
-			if managed, exists := cm.connManager[serverAddr]; exists && managed.connection == conn {
-				managed.status = newStatus
-			}
-			cm.mu.Unlock()
 		}
 		interval := 5 * time.Second
 		if checkInterval > 0 {
@@ -524,47 +525,6 @@ func (cm *ConnectionManager) ReleaseConnection(serverAddr string) error {
 			cm.logger.Error(err)
 		}
 		delete(cm.connManager, serverAddr)
-	}
-	return nil
-}
-
-// RecreateConnection closes the managed ClientConn and dials again. Multi-backend
-// only: used when Collect Send times out on a half-open peer so pick_first can
-// try the standby on a fresh channel. Swaps the connection in place so
-// GetConnectionStatus never returns Shutdown mid-recreate (that would make
-// send loops exit forever and drop post-failover probe spans).
-func (cm *ConnectionManager) RecreateConnection(serverAddr string) error {
-	if !cm.multiBackend {
-		return fmt.Errorf("RecreateConnection is multi-backend only")
-	}
-	conn, err := cm.createConnection()
-	if err != nil {
-		return err
-	}
-	cm.mu.Lock()
-	old, exists := cm.connManager[serverAddr]
-	if !exists {
-		cm.connManager[serverAddr] = &ManagedConnection{
-			connection: conn,
-			status:     ConnectionStatusConnected,
-			refCount:   1,
-		}
-		cm.mu.Unlock()
-		go cm.checkConnectionStatus(serverAddr)
-		if cm.logger != nil {
-			cm.logger.Infof("recreated multi-backend gRPC connection after send/open failure")
-		}
-		return nil
-	}
-	prev := old.connection
-	old.connection = conn
-	old.status = ConnectionStatusConnected
-	cm.mu.Unlock()
-	if prev != nil && prev != conn {
-		_ = prev.Close()
-	}
-	if cm.logger != nil {
-		cm.logger.Infof("recreated multi-backend gRPC connection after send/open failure")
 	}
 	return nil
 }
@@ -592,6 +552,16 @@ func (cm *ConnectionManager) GetConnectionStatus(serverAddr string) ConnectionSt
 	managed, exists := cm.connManager[serverAddr]
 	if !exists {
 		return ConnectionStatusShutdown
+	}
+	if cm.multiBackend {
+		switch managed.connection.GetState() {
+		case connectivity.Ready:
+			return ConnectionStatusConnected
+		case connectivity.Shutdown:
+			return ConnectionStatusShutdown
+		default:
+			return ConnectionStatusDisconnect
+		}
 	}
 	return managed.status
 }

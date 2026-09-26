@@ -189,11 +189,12 @@ func waitCountGrow(t *testing.T, name string, before int64, get func() int64) {
 }
 
 // TestMultiBackendReporterAutoFailsOverAfterActiveStops drives the real
-// gRPCReporter send loop: no manual RecreateConnection. After the active mock
-// stops, MultiBackendSend timeout → reconnectMultiBackend → standby Collect.
+// gRPCReporter send loop. Native pick_first moves reporting to the standby
+// after the active mock stops, without replacing the shared ClientConn.
 func TestMultiBackendReporterAutoFailsOverAfterActiveStops(t *testing.T) {
 	a := serveBackendMocks(t)
 	b := serveBackendMocks(t)
+	defer a.stop()
 	defer b.stop()
 	backends := a.addr() + "," + b.addr()
 	gr := setupMultiReporter(t, backends)
@@ -230,6 +231,7 @@ func TestMultiBackendReporterAutoFailsOverAfterActiveStops(t *testing.T) {
 func TestMultiBackendReporterMetricsAndLogFailOver(t *testing.T) {
 	a := serveBackendMocks(t)
 	b := serveBackendMocks(t)
+	defer a.stop()
 	defer b.stop()
 	backends := a.addr() + "," + b.addr()
 	gr := setupMultiReporter(t, backends)

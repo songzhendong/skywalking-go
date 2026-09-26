@@ -19,6 +19,7 @@ package reporter
 import (
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 
 	"google.golang.org/grpc/resolver"
@@ -76,7 +77,16 @@ func splitBackendServiceAddress(serverAddr string) (host, port string, err error
 	if host == "" || port == "" {
 		return "", "", fmt.Errorf("invalid backend service address %q", serverAddr)
 	}
-	return host, port, nil
+	for _, digit := range port {
+		if digit < '0' || digit > '9' {
+			return "", "", fmt.Errorf("invalid backend service port %q", port)
+		}
+	}
+	portNumber, portErr := strconv.Atoi(port)
+	if portErr != nil || portNumber < 1 || portNumber > 65535 {
+		return "", "", fmt.Errorf("invalid backend service port %q", port)
+	}
+	return host, strconv.Itoa(portNumber), nil
 }
 
 func isIPLiteralHost(host string) bool {
@@ -90,46 +100,20 @@ func isIPLiteralHost(host string) bool {
 	return net.ParseIP(host) != nil
 }
 
-// firstHostnameAuthority returns the first non-IP hostname in the configured
-// backend list (Node-like). Used as TLS ServerName/SNI when dialing IP literals
-// so mixed "ip,hostname" lists still present a DNS name to the certificate.
-func firstHostnameAuthority(backends []string) string {
-	for _, cfg := range backends {
-		host, _, err := splitBackendServiceAddress(cfg)
-		if err != nil {
-			continue
-		}
-		if !isIPLiteralHost(host) {
-			return host
-		}
+// firstBackendAuthority keeps the first configured endpoint, including its port,
+// as the channel authority regardless of the shuffled dial order.
+func firstBackendAuthority(backends []string) string {
+	if len(backends) == 0 {
+		return ""
 	}
-	return ""
-}
-
-func serverNameForDialHost(host, firstHostname string) string {
-	if isIPLiteralHost(host) && firstHostname != "" {
-		return firstHostname
-	}
-	return host
-}
-
-func newResolverAddress(addressHost, serverName, port string) resolver.Address {
-	return resolver.Address{
-		Addr:       net.JoinHostPort(addressHost, port),
-		ServerName: serverName,
-	}
+	return backends[0]
 }
 
 func configuredAddressesAsResolverState(backends []string) []resolver.Address {
-	firstHostname := firstHostnameAuthority(backends)
 	addresses := make([]resolver.Address, 0, len(backends))
 	for _, cfg := range backends {
-		host, port, err := splitBackendServiceAddress(cfg)
-		if err != nil {
-			addresses = append(addresses, resolver.Address{Addr: cfg, ServerName: cfg})
-			continue
-		}
-		addresses = append(addresses, newResolverAddress(host, serverNameForDialHost(host, firstHostname), port))
+		// Inherit the fixed channel authority or explicit credential override.
+		addresses = append(addresses, resolver.Address{Addr: cfg})
 	}
 	return addresses
 }

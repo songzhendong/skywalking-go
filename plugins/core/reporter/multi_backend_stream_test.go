@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"io"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -57,6 +58,8 @@ func TestMultiBackendCollectSendFailsOverAfterActiveStops(t *testing.T) {
 	bSrv := &countingTraceServer{}
 
 	aLis, aGS := serveTrace(t, aSrv)
+	defer aLis.Close()
+	defer aGS.Stop()
 	aAddr := aLis.Addr().String()
 	bLis, bGS := serveTrace(t, bSrv)
 	defer bLis.Close()
@@ -88,11 +91,18 @@ func TestMultiBackendCollectSendFailsOverAfterActiveStops(t *testing.T) {
 	if sendErr := MultiBackendSend(cancel, func() error { return stream.Send(seg) }, time.Second); sendErr != nil {
 		t.Fatalf("initial Send: %v", sendErr)
 	}
-	waitFor(t, func() bool { return aSrv.count.Load() >= 1 }, 5*time.Second)
+	waitFor(t, func() bool { return aSrv.count.Load()+bSrv.count.Load() >= 1 }, 5*time.Second)
 
 	// Stop active like docker kill: close listener hard so the peer half-opens.
-	aGS.Stop()
-	_ = aLis.Close()
+	standby := bSrv
+	if aSrv.count.Load() > 0 {
+		aGS.Stop()
+		_ = aLis.Close()
+	} else {
+		bGS.Stop()
+		_ = bLis.Close()
+		standby = aSrv
+	}
 
 	// Bound Send: either errors quickly or is canceled by MultiBackendSend.
 	_ = MultiBackendSend(cancel, func() error {
@@ -100,30 +110,33 @@ func TestMultiBackendCollectSendFailsOverAfterActiveStops(t *testing.T) {
 	}, 2*time.Second)
 	cancel()
 
-	// Mirror production: recreate ClientConn so pick_first can leave the dead peer.
-	if recreateErr := cm.RecreateConnection(backends); recreateErr != nil {
-		t.Fatalf("RecreateConnection: %v", recreateErr)
+	// Native pick_first recovers on the same channel and generated stub.
+	before := standby.count.Load()
+	deadline := time.Now().Add(15 * time.Second)
+	for attempt := 0; time.Now().Before(deadline); attempt++ {
+		// The first RPC after Stop can race transport failure detection. Drop
+		// that failed report and probe with a new ID, just as the reporter does.
+		probeID := "post-stop-" + strconv.Itoa(attempt)
+		if sendTraceProbe(client, cm.GetMD(), probeID) == nil && standby.count.Load() > before {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	conn = cm.PeekConnection(backends)
-	if conn == nil {
-		t.Fatal("PeekConnection nil after recreate")
-	}
-	client = agentv3.NewTraceSegmentReportServiceClient(conn)
+	t.Fatal("new reports did not reach the standby on the existing channel")
+}
 
-	ctx2, cancel2, stopOpen2 := BackendStreamContext(backends, 5*time.Second)
-	defer cancel2()
-	conn.Connect()
-	stream2, collectErr := client.Collect(metadata.NewOutgoingContext(ctx2, cm.GetMD()))
-	if timedOut := stopOpen2(); collectErr != nil || timedOut {
-		t.Fatalf("reopen Collect: err=%v timedOut=%v", collectErr, timedOut)
+func sendTraceProbe(client agentv3.TraceSegmentReportServiceClient, md metadata.MD, id string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	stream, err := client.Collect(metadata.NewOutgoingContext(ctx, md), grpc.WaitForReady(true))
+	if err != nil {
+		return err
 	}
-	before := bSrv.count.Load()
-	if sendErr := MultiBackendSend(cancel2, func() error {
-		return stream2.Send(&agentv3.SegmentObject{TraceId: "t3", TraceSegmentId: "s3"})
-	}, 5*time.Second); sendErr != nil {
-		t.Fatalf("standby Send: %v", sendErr)
+	if sendErr := stream.Send(&agentv3.SegmentObject{TraceId: id, TraceSegmentId: id}); sendErr != nil {
+		return sendErr
 	}
-	waitFor(t, func() bool { return bSrv.count.Load() > before }, 15*time.Second)
+	_, err = stream.CloseAndRecv()
+	return err
 }
 
 func serveTrace(t *testing.T, srv agentv3.TraceSegmentReportServiceServer) (net.Listener, *grpc.Server) {
@@ -167,63 +180,7 @@ func TestMultiBackendSendReturnsWhenSendIgnoresCancel(t *testing.T) {
 	}
 }
 
-func TestRecreateConnectionKeepsStatusConnected(t *testing.T) {
-	aLis, aGS := serveTrace(t, &countingTraceServer{})
-	defer aLis.Close()
-	defer aGS.Stop()
-	bLis, bGS := serveTrace(t, &countingTraceServer{})
-	defer bLis.Close()
-	defer bGS.Stop()
-
-	backends := aLis.Addr().String() + "," + bLis.Addr().String()
-	cm, err := NewConnectionManager(nil, time.Second, backends, "", nil)
-	if err != nil {
-		t.Fatalf("NewConnectionManager: %v", err)
-	}
-	defer cm.Close()
-	if _, getErr := cm.GetConnection(backends); getErr != nil {
-		t.Fatalf("GetConnection: %v", getErr)
-	}
-
-	var sawShutdown atomic.Bool
-	stop := make(chan struct{})
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-				if cm.GetConnectionStatus(backends) == ConnectionStatusShutdown {
-					sawShutdown.Store(true)
-				}
-				time.Sleep(time.Millisecond)
-			}
-		}
-	}()
-
-	for i := 0; i < 5; i++ {
-		if recreateErr := cm.RecreateConnection(backends); recreateErr != nil {
-			close(stop)
-			wg.Wait()
-			t.Fatalf("RecreateConnection: %v", recreateErr)
-		}
-	}
-	time.Sleep(50 * time.Millisecond)
-	close(stop)
-	wg.Wait()
-
-	if sawShutdown.Load() {
-		t.Fatal("GetConnectionStatus returned Shutdown during RecreateConnection")
-	}
-	if got := cm.GetConnectionStatus(backends); got != ConnectionStatusConnected {
-		t.Fatalf("status after recreate = %v, want Connected", got)
-	}
-}
-
-func TestMultiBackendStatusStaysConnectedAfterConnClose(t *testing.T) {
+func TestMultiBackendStatusReflectsConnClose(t *testing.T) {
 	aLis, aGS := serveTrace(t, &countingTraceServer{})
 	defer aLis.Close()
 	defer aGS.Stop()
@@ -242,22 +199,42 @@ func TestMultiBackendStatusStaysConnectedAfterConnClose(t *testing.T) {
 		t.Fatalf("GetConnection: %v", err)
 	}
 	_ = conn.Close()
-	// Status watcher must not publish Shutdown while the map entry remains.
-	deadline := time.Now().Add(500 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if cm.GetConnectionStatus(backends) == ConnectionStatusShutdown {
-			t.Fatal("multi-backend status became Shutdown after ClientConn.Close")
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if got := cm.GetConnectionStatus(backends); got != ConnectionStatusConnected {
-		t.Fatalf("status=%v want Connected", got)
+	if got := cm.GetConnectionStatus(backends); got != ConnectionStatusShutdown {
+		t.Fatalf("status=%v want Shutdown", got)
 	}
 }
 
-// Concurrent GetConnection / RecreateConnection / ReleaseConnection used to race
-// on the unlocked connManager map (Codex P1). Stress the locked paths.
-func TestConcurrentGetRecreateRelease(t *testing.T) {
+func TestMultiBackendSendPanicReachesCaller(t *testing.T) {
+	for _, afterCancel := range []bool{false, true} {
+		name := "immediate"
+		if afterCancel {
+			name = "after timeout cancellation"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var recovered interface{}
+			func() {
+				defer func() { recovered = recover() }()
+				_ = MultiBackendSend(cancel, func() error {
+					if afterCancel {
+						<-ctx.Done()
+					}
+					panic("protobuf marshal panic")
+				}, 20*time.Millisecond)
+			}()
+			if recovered != "protobuf marshal panic" {
+				t.Fatalf("caller recovered %v, want original panic", recovered)
+			}
+			if err := MultiBackendSend(cancel, func() error { return nil }, time.Second); err != nil {
+				t.Fatalf("next send failed: %v", err)
+			}
+		})
+	}
+}
+
+// Concurrent acquisition and release must preserve shared connection ownership.
+func TestConcurrentGetRelease(t *testing.T) {
 	aLis, aGS := serveTrace(t, &countingTraceServer{})
 	defer aLis.Close()
 	defer aGS.Stop()
@@ -278,11 +255,14 @@ func TestConcurrentGetRecreateRelease(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 20; j++ {
-				if _, getErr := cm.GetConnection(backends); getErr != nil {
+				conn, getErr := cm.GetConnection(backends)
+				if getErr != nil {
 					t.Errorf("GetConnection: %v", getErr)
 					return
 				}
-				_ = cm.RecreateConnection(backends)
+				if conn.GetState() == connectivity.Shutdown {
+					t.Error("acquired connection closed while its reference is held")
+				}
 				_ = cm.ReleaseConnection(backends)
 				_ = cm.PeekConnection(backends)
 				_ = cm.GetConnectionStatus(backends)
@@ -290,64 +270,6 @@ func TestConcurrentGetRecreateRelease(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-}
-
-func TestRecreateConnectionUnblocksHungMultiBackendSend(t *testing.T) {
-	// Codex P2: MultiBackendSend may detach a Send goroutine; RecreateConnection
-	// must Close the old ClientConn so that goroutine can exit.
-	aLis, aGS := serveTrace(t, &countingTraceServer{})
-	defer aLis.Close()
-	defer aGS.Stop()
-	bLis, bGS := serveTrace(t, &countingTraceServer{})
-	defer bLis.Close()
-	defer bGS.Stop()
-
-	backends := aLis.Addr().String() + "," + bLis.Addr().String()
-	cm, err := NewConnectionManager(nil, 50*time.Millisecond, backends, "", nil)
-	if err != nil {
-		t.Fatalf("NewConnectionManager: %v", err)
-	}
-	defer cm.Close()
-	if _, getErr := cm.GetConnection(backends); getErr != nil {
-		t.Fatalf("GetConnection: %v", getErr)
-	}
-
-	oldTimeout, oldGrace := multiBackendSendTimeout, multiBackendSendCancelGrace
-	multiBackendSendTimeout = 200 * time.Millisecond
-	multiBackendSendCancelGrace = 50 * time.Millisecond
-	defer func() {
-		multiBackendSendTimeout = oldTimeout
-		multiBackendSendCancelGrace = oldGrace
-	}()
-
-	started := make(chan struct{})
-	unblocked := make(chan struct{})
-	go func() {
-		_ = MultiBackendSend(nil, func() error {
-			close(started)
-			conn := cm.PeekConnection(backends)
-			if conn == nil {
-				return nil
-			}
-			// Block until the ClientConn is closed by RecreateConnection.
-			for conn.GetState() != connectivity.Shutdown {
-				if !conn.WaitForStateChange(context.Background(), conn.GetState()) {
-					break
-				}
-			}
-			close(unblocked)
-			return errMultiBackendSendTimeout
-		}, 0)
-	}()
-	<-started
-	if recreateErr := cm.RecreateConnection(backends); recreateErr != nil {
-		t.Fatalf("RecreateConnection: %v", recreateErr)
-	}
-	select {
-	case <-unblocked:
-	case <-time.After(3 * time.Second):
-		t.Fatal("hung send did not unblock after RecreateConnection closed old conn")
-	}
 }
 
 func TestMultiBackendServiceConfigRetryOnlyProperties(t *testing.T) {
@@ -386,55 +308,7 @@ func TestMultiBackendServiceConfigRetryOnlyProperties(t *testing.T) {
 	}
 }
 
-// TestRaceConnManagerGetRecreate is picked up by `make test-race` (-run '^TestRace').
-func TestRaceConnManagerGetRecreate(t *testing.T) {
-	TestConcurrentGetRecreateRelease(t)
-}
-
-// TestRacePprofClientSwap is picked up by `make test-race` (-run '^TestRace').
-// Concurrent recreate and currentPprofClient/load must not race on the client field.
-func TestRacePprofClientSwap(t *testing.T) {
-	aLis, aGS := serveTrace(t, &countingTraceServer{})
-	defer aLis.Close()
-	defer aGS.Stop()
-	bLis, bGS := serveTrace(t, &countingTraceServer{})
-	defer bLis.Close()
-	defer bGS.Stop()
-
-	backends := aLis.Addr().String() + "," + bLis.Addr().String()
-	cm, err := NewConnectionManager(nil, 50*time.Millisecond, backends, "", nil)
-	if err != nil {
-		t.Fatalf("NewConnectionManager: %v", err)
-	}
-	defer cm.Close()
-	pm, err := NewPprofTaskManager(nil, backends, time.Hour, cm, t.TempDir())
-	if err != nil {
-		t.Fatalf("NewPprofTaskManager: %v", err)
-	}
-
-	var wg sync.WaitGroup
-	stop := make(chan struct{})
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-				_ = cm.RecreateConnection(backends)
-				time.Sleep(time.Millisecond)
-			}
-		}
-	}()
-	go func() {
-		defer wg.Done()
-		for i := 0; i < 200; i++ {
-			_ = pm.currentPprofClient()
-			_ = pm.loadPprofClient()
-		}
-	}()
-	time.Sleep(200 * time.Millisecond)
-	close(stop)
-	wg.Wait()
+// TestRaceConnManagerGetRelease is picked up by `make test-race` (-run '^TestRace').
+func TestRaceConnManagerGetRelease(t *testing.T) {
+	TestConcurrentGetRelease(t)
 }

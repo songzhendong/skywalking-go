@@ -25,6 +25,7 @@ import (
 	_ "crypto/x509"
 	_ "fmt"
 	_ "io"
+	_ "math/rand"
 	_ "net"
 	_ "os"
 	_ "runtime"

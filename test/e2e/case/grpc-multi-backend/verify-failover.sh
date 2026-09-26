@@ -153,7 +153,7 @@ if [[ "${running_a}" -eq 1 && "${running_b}" -eq 1 ]]; then
 
   echo "killing active backend ${active_svc} (probe ${PROBE_NEEDLE})" >&2
   docker kill "$(running_container_id "${active_svc}")" >/dev/null
-  # Allow MultiBackendSend timeout (8s) + recreate + pick_first to standby.
+  # Allow the transport and native pick_first to reconnect to the standby.
   sleep 20
   assert_standby "${standby_url}"
 elif [[ "${running_a}" -eq 1 ]]; then

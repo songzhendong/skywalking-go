@@ -36,7 +36,7 @@ trigger:
 verify:
   retry:
     # Bound total wall time under the 90m GHA e2e job timeout. Each attempt
-    # already waits for MultiBackendSend (8s) + recreate + traffic growth.
+    # already waits for transport recovery and standby traffic growth.
     count: 12
     interval: 5s
   cases:
