@@ -32,7 +32,11 @@ func sendLogEntry(level string, args ...interface{}) {
 	if len(args) == 0 {
 		return
 	}
-	logReporter, ok := operator.GetOperator().LogReporter().(operator.LogReporter)
+	op := operator.GetOperator()
+	if op == nil {
+		return
+	}
+	logReporter, ok := op.LogReporter().(operator.LogReporter)
 	if !ok || logReporter == nil {
 		return
 	}
@@ -50,7 +54,8 @@ func parseLabels(args interface{}) map[string]string {
 	}
 
 	ret := make(map[string]string)
-	for i := 0; i < len(keyValues); i += 2 {
+	// i+1 bound avoids panic when callers pass an odd number of keyValues.
+	for i := 0; i+1 < len(keyValues); i += 2 {
 		v1 := keyValues[i]
 		v2 := keyValues[i+1]
 		ret[v1] = v2

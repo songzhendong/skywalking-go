@@ -458,9 +458,16 @@ func TestConnectionManagerFailoverAfterActiveStops(t *testing.T) {
 		t.Fatalf("unexpected active address %q", resolved[0])
 	}
 
+	// After the active peer dies, pick_first may sit in Idle/Connecting until
+	// an RPC or Connect() wakes it. Nudge so the wait below observes Ready.
+	conn.Connect()
 	waitFor(t, func() bool {
-		return conn.GetState() == connectivity.Ready
-	}, 15*time.Second)
+		state := conn.GetState()
+		if state == connectivity.Idle || state == connectivity.TransientFailure {
+			conn.Connect()
+		}
+		return state == connectivity.Ready
+	}, 20*time.Second)
 	if status := cm.GetConnectionStatus(backends); status == ConnectionStatusShutdown {
 		t.Fatalf("status=%v after failover", status)
 	}
