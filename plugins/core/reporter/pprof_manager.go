@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc/metadata"
@@ -70,6 +72,10 @@ type PprofTaskManager struct {
 	commands       PprofTaskCommand
 	pprofSendCh    chan *pprofv10.PprofData
 	pprofClient    pprofv10.PprofTaskClient
+	// sendChClosed is set before pprofSendCh is closed so ReportPprof* can
+	// skip sends without panicking on a closed channel.
+	sendChClosed  atomic.Bool
+	closeSendOnce sync.Once
 }
 
 func NewPprofTaskManager(logger operator.LogOperator, serverAddr string,
@@ -103,36 +109,43 @@ func (r *PprofTaskManager) InitPprofTask(entity *Entity) {
 		for {
 			switch r.connManager.GetConnectionStatus(r.serverAddr) {
 			case ConnectionStatusShutdown:
+				r.closeSendCh()
 				return
 			case ConnectionStatusDisconnect:
 				time.Sleep(r.pprofInterval)
 				continue
 			}
-			ctx, cancel := BackendRPCContext(r.pprofInterval)
-			if r.pprofClient == nil {
+			// Recover per iteration so a panic in HandleCommand / StopTask
+			// cannot tear down the fetch loop (aligned with CDS/kafka check).
+			func() {
+				defer func() {
+					if err := recover(); err != nil {
+						r.logger.Errorf("PprofTaskManager InitPprofTask panic err %v", err)
+					}
+				}()
+				ctx, cancel := BackendRPCContext(r.pprofInterval)
+				if r.pprofClient == nil {
+					cancel()
+					return
+				}
+				pprofCommand, err := r.pprofClient.GetPprofTaskCommands(
+					metadata.NewOutgoingContext(ctx, r.connManager.GetMD()),
+					&pprofv10.PprofTaskCommandQuery{
+						Service:         r.entity.ServiceName,
+						ServiceInstance: r.entity.ServiceInstanceName,
+						LastCommandTime: r.LastUpdateTime,
+					})
 				cancel()
-				time.Sleep(r.pprofInterval)
-				continue
-			}
-			pprofCommand, err := r.pprofClient.GetPprofTaskCommands(
-				metadata.NewOutgoingContext(ctx, r.connManager.GetMD()),
-				&pprofv10.PprofTaskCommandQuery{
-					Service:         r.entity.ServiceName,
-					ServiceInstance: r.entity.ServiceInstanceName,
-					LastCommandTime: r.LastUpdateTime,
-				})
-			cancel()
-			if err != nil {
-				r.logger.Errorf("fetch pprof task commands error %v", err)
-				time.Sleep(r.pprofInterval)
-				continue
-			}
+				if err != nil {
+					r.logger.Errorf("fetch pprof task commands error %v", err)
+					return
+				}
 
-			if len(pprofCommand.GetCommands()) > 0 && pprofCommand.GetCommands()[0].Command == "PprofTaskQuery" {
-				rawCommand := pprofCommand.GetCommands()[0]
-				r.HandleCommand(rawCommand)
-			}
-
+				if len(pprofCommand.GetCommands()) > 0 && pprofCommand.GetCommands()[0].Command == "PprofTaskQuery" {
+					rawCommand := pprofCommand.GetCommands()[0]
+					r.HandleCommand(rawCommand)
+				}
+			}()
 			time.Sleep(r.pprofInterval)
 		}
 	}()
@@ -170,6 +183,11 @@ func (r *PprofTaskManager) HandleCommand(rawCommand *commonv3.Command) {
 			return
 		}
 		time.AfterFunc(command.GetDuration(), func() {
+			defer func() {
+				if err := recover(); err != nil {
+					r.logger.Errorf("PprofTaskManager StopTask panic err %v", err)
+				}
+			}()
 			command.StopTask(writer)
 		})
 	}
@@ -246,11 +264,7 @@ func (r *PprofTaskManager) ReportPprof(taskID string, content []byte) {
 		},
 	}
 
-	select {
-	case r.pprofSendCh <- pprofData:
-	default:
-		r.logger.Errorf("reach max pprof send buffer")
-	}
+	r.tryEnqueuePprof(pprofData)
 }
 
 func (r *PprofTaskManager) ReportPprofError(taskID string, err error) {
@@ -269,11 +283,31 @@ func (r *PprofTaskManager) ReportPprofError(taskID string, err error) {
 		},
 	}
 
+	r.tryEnqueuePprof(pprofData)
+}
+
+func (r *PprofTaskManager) tryEnqueuePprof(pprofData *pprofv10.PprofData) {
+	if r.sendChClosed.Load() {
+		return
+	}
+	// Guard against a close that races between the Load and the send.
+	defer func() {
+		_ = recover()
+	}()
 	select {
 	case r.pprofSendCh <- pprofData:
 	default:
-		r.logger.Errorf("reach max pprof send buffer")
+		if !r.sendChClosed.Load() {
+			r.logger.Errorf("reach max pprof send buffer")
+		}
 	}
+}
+
+func (r *PprofTaskManager) closeSendCh() {
+	r.closeSendOnce.Do(func() {
+		r.sendChClosed.Store(true)
+		close(r.pprofSendCh)
+	})
 }
 
 func (r *PprofTaskManager) initPprofSendPipeline() {
@@ -283,20 +317,26 @@ func (r *PprofTaskManager) initPprofSendPipeline() {
 				r.logger.Errorf("PprofTaskManager initPprofSendPipeline panic err %v", err)
 			}
 		}()
-	StreamLoop:
 		for {
 			switch r.connManager.GetConnectionStatus(r.serverAddr) {
 			case ConnectionStatusShutdown:
+				r.closeSendCh()
 				return
 			case ConnectionStatusDisconnect:
 				time.Sleep(5 * time.Second)
-				continue StreamLoop
+				continue
 			}
 
-			for pprofData := range r.pprofSendCh {
+			// Non-blocking status recheck so Shutdown can unblock the pipeline
+			// without waiting for the next pprof payload.
+			select {
+			case pprofData, ok := <-r.pprofSendCh:
+				if !ok {
+					return
+				}
 				r.uploadPprofData(pprofData)
+			case <-time.After(5 * time.Second):
 			}
-			break
 		}
 	}()
 }

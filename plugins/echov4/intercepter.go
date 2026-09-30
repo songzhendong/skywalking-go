@@ -58,7 +58,8 @@ func middleware() echo.MiddlewareFunc {
 				tracing.WithTag(tracing.TagURL, request.Host+request.URL.Path),
 				tracing.WithComponent(5015))
 			if err != nil {
-				return err
+				// Tracing must not abort the HTTP request (e.g. malformed sw8).
+				return continueWithoutSpan(next, c, err)
 			}
 			// serve the request to the next middleware
 			if err = next(c); err != nil {
@@ -71,4 +72,11 @@ func middleware() echo.MiddlewareFunc {
 			return nil
 		}
 	}
+}
+
+// continueWithoutSpan runs the next handler when entry-span creation fails.
+// The span error is intentionally discarded so agent tracing cannot take down
+// the request (returning that error previously aborted Echo handlers).
+func continueWithoutSpan(next echo.HandlerFunc, c echo.Context, _ error) error {
+	return next(c)
 }
